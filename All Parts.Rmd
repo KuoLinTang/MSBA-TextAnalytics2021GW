@@ -1,0 +1,3765 @@
+---
+title: "Text Analytics"
+author: "Group 16"
+date: "22/05/2021"
+output:
+  word_document: default
+  html_document: 
+    toc: true
+    toc_depth: 3
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(error = TRUE)
+```
+
+
+# Importing required packages
+```{r, message=FALSE}
+#Loading all relevant packages
+library(tidyverse)
+library(dplyr)
+library(stringr)
+library(data.table)
+library(rvest)
+library(tidytext)
+library(qdap)
+library(tm)
+library(magrittr)
+library(textcat)
+library(cld2)
+library(textstem)
+library(lexicon)
+library(wordcloud)
+library(quanteda)
+library(data.table)
+library(topicmodels)
+library(udpipe)
+library(stm)
+library(textclean)
+library(corrplot)
+library(ggraph)
+library(igraph)
+library(ggthemes)
+library(radarchart)
+library(circlize)
+```
+
+# Downloading datasets
+Extracting the oldest files from the website for Bristol city, dating 23rd May 2020.
+```{r, message=FALSE}
+#reading the given airbnb url and extracting the index for Bristol city
+url_data <- read_html("http://insideairbnb.com/get-the-data.html")
+n <- url_data %>% html_nodes("table") %>% str_which("Bristol")
+
+all_cities <- url_data %>% html_nodes("table")
+all_cities[n]
+
+#extracting all available urls for Bristol
+bristol_urls <- as.data.frame(all_cities[n] %>% html_nodes("a") %>% html_attr("href"))
+colnames(bristol_urls) <- "url"
+
+#extracting and formatting the date
+for(n in 1:nrow(bristol_urls)){
+bristol_urls$date[n] <- str_split(bristol_urls$url, "/")[[n]][7]}
+
+bristol_urls$date <- as.Date(bristol_urls$date)
+
+#we are interested in the data before the pandemic, hence we are extracting the oldest file, dated 23 May 2020
+oldest_urls <- bristol_urls %>% arrange(date) %>% slice(1:7)
+
+#downloading listings dataset
+listings_url <- oldest_urls[which(str_detect(oldest_urls$url, "listings.csv.gz")),1]
+download.file(listings_url, "listings.csv.gz")
+listings <- read_csv("listings.csv.gz")
+head(listings)
+
+#downloading reviews dataset
+reviews_url <- oldest_urls[which(str_detect(oldest_urls$url, "reviews.csv.gz")),1]
+download.file(reviews_url, "reviews.csv.gz")
+reviews <- read_csv("reviews.csv.gz")
+head(reviews)
+
+#downloadings calendar dataset
+calendar_urls <- bristol_urls[which(str_detect(bristol_urls$url, "calendar.csv.gz")),]
+for (i in 1:nrow(calendar_urls)){
+  file_name <- paste0(i, "_calendar.csv.gz")
+  download.file(calendar_urls$url[i], paste0(file_name))
+}
+
+calendar_df <- list.files(pattern = "calendar.csv.gz", full.names = TRUE) %>% lapply(read_csv) %>% bind_rows()
+head(calendar_df)
+
+#we used inner join to get the final dataset of all listings and their reviews
+listings = listings %>% rename(listing_id = id)
+reviews = reviews %>% rename(review_id = id)
+
+lr_data <- left_join(listings, reviews)
+
+#clearing memory
+remove(reviews, listings_url, reviews_url, bristol_urls, all_cities, oldest_urls, url_data, n, i, calendar_urls, file_name, calendar_df)
+#lr_data - 101020x111 size
+```
+
+
+# Part A
+## Review Pre-processing
+### Remove listings with few reviews
+We removed the listings with less than 5 reviews, as they could be new properties. These new properties have few reviews so that those rating scores may not be stable so those reviews do not reflect the effect of rating.
+```{r}
+lr_data <- lr_data %>% 
+  group_by(listing_id) %>% 
+  mutate(total_reviews_per_listing = n()) %>% 
+  ungroup()
+
+#lets look at the distribution of reviews per listing
+ggplot(lr_data %>% 
+         select(listing_id, total_reviews_per_listing) %>% 
+         unique, aes(x = total_reviews_per_listing)) +
+  geom_histogram(binwidth = 10)
+
+
+lr_data <- lr_data %>%
+  filter(total_reviews_per_listing >= 5)
+
+#distribution after removing listings with few reviews
+ggplot(lr_data %>% 
+         select(listing_id, total_reviews_per_listing) %>% 
+         unique, aes(x = total_reviews_per_listing)) +
+  geom_histogram(binwidth = 10)
+```
+99466 reviews
+
+### Filtering only English comments
+a. Detect language of comments using textcat package
+```{r eval = FALSE}
+lr_data$comments = iconv(lr_data$comments) 
+#The iconv() function converts a sequence of characters in one character encoding to a sequence of characters in another character encoding.
+
+lr_data$comments_language_textcat = textcat(lr_data$comments)
+
+saveRDS(lr_data, "lr_data_after_textcat.rds")
+```
+textcat took about 20 minutes of time to identify the language
+```{r}
+lr_data = readRDS("lr_data_after_textcat.rds")
+```
+
+
+b. Detect language of comments using cld2 package
+```{r}
+lr_data = lr_data %>%
+  mutate(comments_language_cld2 = detect_language(comments))
+```
+cld2 is much faster in detecting language
+
+Filtering only English reviews, detected by both methods.
+```{r}
+lr_data <- lr_data %>% filter(comments_language_textcat == "english" & comments_language_cld2 == "en")
+```
+88717 reviews
+
+
+### Removing short reviews
+calculating average review length per listing and removing short. Since sentiment analysis is sensitive to the review length, we can remove short reviews, keeping reviews of length larger than 10 words.
+We choose number of words here because sentiments are defined for each word not for each character.
+
+```{r}
+#Count number of words per comment (excluding digits and punctuations)
+
+lr_data$number_of_words <- stringr::str_count(lr_data$comments, "\\b[A-Za-z]+\\b")
+
+hist(lr_data$number_of_words, breaks = 150, main = "Number of words per review")
+
+```
+
+```{r}
+lr_data_filtered = lr_data %>%
+  filter(number_of_words >= 10)
+```
+77474 reviews
+
+### Dependent Variable Inspection
+inspecting the dependent variables, price and review_scores_rating
+```{r}
+lr_data_filtered$price <- as.numeric(gsub("\\$", "", lr_data_filtered$price))
+
+hist(lr_data_filtered$price, breaks = 200, main = "Distribution of price")
+#price does not follow a normal distribution, skewed towards left
+
+hist(lr_data_filtered$review_scores_rating, breaks = 200, main = "Distribution of review ratings")
+#skewed towards right
+
+#hence we modify both the dependent variables
+```
+
+### Removing contractions
+Contractions are shortened version of words or syllables and often exist in either written forms of English language. These shortened versions or contractions of words are created by removing specific letters. In case of English contractions, they are often created by removing one of the vowels from the word. Examples would be, do not to don’t and I would to I’d. Converting each contraction to its expanded, original form helps with text standardization.
+
+
+key_contractions dataset from lexicon package has the most common contractions and their expanded form
+Example - Review_num 70 has "You can't deny the facts,..." 
+we convert can't to "You can not deny the facts,..."
+
+```{r}
+lr_data_filtered$no_contraction_comments <- replace_contraction(lr_data_filtered$comments, key_contractions)
+```
+
+
+### Removing extra spaces
+```{r}
+lr_data_filtered$trimmed_comments <- str_trim(lr_data_filtered$no_contraction_comments)
+
+```
+
+### Add a period/space after fullstops
+In some reviews there is a pattern where period is missing after fullstops. Single token will be generated in the place of two.
+```{r}
+lr_data_filtered$spaced_comments <- lr_data_filtered$trimmed_comments
+
+lr_data_filtered$spaced_comments <- gsub("\\.(?=[A-Za-z])", ". ", lr_data_filtered$spaced_comments, perl = T)
+
+```
+
+### Extract special characters
+All Punctuations, including exclaimation marks are extracted
+```{r}
+lr_data_filtered$number_of_punctuations = stringr::str_count(lr_data_filtered$spaced_comments,  "[[:punct:]]")
+
+lr_data_filtered$number_of_exclamations = stringr::str_count(lr_data_filtered$spaced_comments,  "[!]")
+
+lr_data_filtered$special_chars <- str_extract_all(lr_data_filtered$spaced_comments, "[[:punct:]]")
+lr_data_filtered$special_chars <- str_extract_all(lr_data_filtered$spaced_comments, "[!]")
+```
+
+
+
+### Extract all the words with capital letters
+Few reviews have words like AMAZING, HIGHLY, MAGICAL etc, which can be amplifiers. The pattern would exclude A, I, ON or any other single/double capital character token.
+```{r}
+lr_data_filtered$number_of_words_are_all_capital = stringr::str_count(lr_data_filtered$spaced_comments,  "\\b[A-Z][A-Z][A-Z]+\\b")
+
+lr_data_filtered$capital_words <- str_extract_all(lr_data_filtered$spaced_comments, "\\b[A-Z][A-Z][A-Z]+\\b")
+```
+
+```{r}
+saveRDS(lr_data_filtered, "lr_data_filtered.rds")
+```
+
+
+### Tokenization
+#### Creating tokens
+```{r}
+all_reviews_tokens <- lr_data_filtered %>%
+  unnest_tokens(output = word, input = spaced_comments)
+
+
+all_reviews_tokens %>% group_by(word) %>% summarise(word_count = n()) %>% arrange(desc(word_count)) %>% top_n(10)
+
+```
+Most of the popular top10 words are stop words like and, the, a etc. (3324085 tokens in total)
+
+
+#### Remove non-ascii characters
+We observed lots of nonascii tokens, replacing them with " "
+```{r eval = FALSE}
+tools::showNonASCII(all_reviews_tokens$word)
+```
+
+```{r}
+all_reviews_tokens$word = str_trim(gsub("\u001a", " ", stringi::stri_enc_toascii(all_reviews_tokens$word)))
+```
+
+Rechecking if there are still nonascii tokens
+```{r}
+tools::showNonASCII(all_reviews_tokens$word)
+```
+
+
+#### Lemmatization
+```{r}
+all_reviews_tokens$lem_token <- lemmatize_words(all_reviews_tokens$word)
+
+lem_reviews_tokens <- all_reviews_tokens %>% select(listing_id, review_id, lem_token)
+
+lem_reviews_tokens <- lem_reviews_tokens %>% rename(word = lem_token)
+
+lem_reviews_tokens %>% group_by(word) %>% summarise(word_count = n()) %>% arrange(desc(word_count)) %>% top_n(10)
+
+```
+
+
+#### Remove digits from the tokens
+```{r}
+
+lem_reviews_tokens$digit = str_detect(lem_reviews_tokens$word, "[0-9]+")
+
+lem_reviews_tokens = lem_reviews_tokens %>%
+  filter(digit != T)
+
+```
+3305670 tokens in total
+
+
+### Removing stopwords
+
+using two dictionaries, tf_idf weightage and custom stopwords
+
+i. using stopwords dictionaries, we remove all the common stop_words
+```{r}
+
+
+review_tokens_common_sw_removed <- lem_reviews_tokens %>% anti_join(stop_words)
+review_tokens_common_sw_removed %>% group_by(word) %>% summarise(wordcount = n()) %>% arrange(desc(wordcount))
+```
+
+ii. Removing Fry's most common words
+Fry’s Word List: The first 25 make up about one-third of all printed material in English. The first 100 make up about one-half of all printed material in English. The first 300 make up about 65% of all printed material in English.
+
+After removing Fry's 100, we still have words such as be, our etc retained. 
+Removing Fry's 1000 resulted in removing many words.
+So, we are going ahead to remove Fry's 200 words.
+```{r}
+#removing top 100 stop words from all_tokens
+#tokens reduced from 2,609,470 to 1455871
+
+fry_df100 <- as.data.frame(sw_fry_100)
+colnames(fry_df100) <- "word"
+
+fry_100_removed <- lem_reviews_tokens %>% anti_join(fry_df100)
+
+fry_100_removed %>% group_by(word) %>% summarise(wordcount = n()) %>% arrange(desc(wordcount))
+  
+  
+#now we remove fry200 stop words
+#tokens reduced from 3291585 to 1472349
+fry_df200 <- as.data.frame(sw_fry_200)
+colnames(fry_df200) <- "word"
+
+review_tokens_fry_200_removed <- lem_reviews_tokens %>% anti_join(fry_df200)
+
+review_tokens_fry_200_removed %>% group_by(word) %>% summarise(wordcount = n()) %>% arrange(desc(wordcount))
+
+
+#removing fry1000 stopwords
+#tokens reduced from 2,609,470 to 759263
+fry_df1000 <- as.data.frame(sw_fry_1000)
+colnames(fry_df1000) <- "word"
+
+fry_1000_removed <- lem_reviews_tokens %>% anti_join(fry_df1000)
+
+fry_1000_removed %>% group_by(word) %>% summarise(wordcount = n()) %>% arrange(desc(wordcount))
+#the word "clean" is removed from this list, which would be a useful word in this analysis. 
+#hence, we can remove only fry's 100 words.
+```
+
+```{r}
+#cleaning memory
+remove(fry_df100, fry_100_removed, fry_df1000, fry_1000_removed, fry_df200)
+
+```
+
+iii. removing stopwords using tf-idf weights
+ziph's law
+```{r}
+term_freq = lem_reviews_tokens %>%
+  count(word, sort = TRUE) %>%
+  mutate(TotalWords = sum(n),
+         rank = row_number(),
+         tf = n / TotalWords) 
+
+term_freq %>%
+  ggplot(aes(x = rank, y = tf)) + 
+  geom_line(size = 1.1, show.legend = FALSE) +
+  scale_x_log10() +
+  scale_y_log10()
+
+rm(term_freq)
+```
+
+If using listing_id as the documents, there will be too many stop words
+```{r eval = FALSE}
+tf_idf_for_reviews = lem_reviews_tokens %>%
+  count(word, review_id) %>%
+  bind_tf_idf(word, review_id, n)
+
+saveRDS(tf_idf_for_reviews, "tf_idf_for_reviews.rds")
+```
+
+
+```{r}
+tf_idf_for_reviews = readRDS("tf_idf_for_reviews.rds")
+
+tf_idf_sw_for_reviews = tf_idf_for_reviews %>%
+  filter(tf_idf < 0.0015) %>%
+  mutate(word = word, lexicon="tfidf") %>% 
+  select(word, lexicon) %>% 
+  distinct()
+```
+
+
+removing tf_idf stopwords after removing Fry's 200 most common words are removed.
+```{r}
+clean_reviews_tokens <- review_tokens_fry_200_removed %>% anti_join(tf_idf_sw_for_reviews)
+
+clean_reviews_tokens %>% group_by(word) %>% summarise(wordcount = n()) %>% arrange(desc(wordcount))
+```
+
+### Remove tokens with number of characters
+observing tokens with 1 alphabet
+```{r}
+clean_reviews_tokens$token_length <- str_length(clean_reviews_tokens$word)
+#observing single tokens
+clean_reviews_tokens %>% filter(token_length==1) %>% group_by(word) %>% summarise(total=n()) %>% arrange(desc(total))
+#they don't contribute, can remove them
+#removing tokens with one alphabet
+clean_reviews_tokens <- clean_reviews_tokens %>% filter(token_length>1)
+```
+
+observing tokens with 2 alphabets
+```{r}
+clean_reviews_tokens %>% filter(token_length==2) %>% group_by(word) %>% summarise(num = n()) %>% arrange(desc(num))
+#there are above 384 words with 2 token length, which seem not important. WHAT ABT TV??? are we removing wi and fi - shoud we club them?
+#removing these tokens
+
+clean_reviews_tokens <- clean_reviews_tokens %>% filter(token_length>2 | word == "tv")
+```
+
+observing tokens with 3 alphabets
+```{r}
+clean_reviews_tokens %>% filter(token_length==3) %>% group_by(word) %>% summarise(num = n()) %>% arrange(desc(num))
+#we have words like bed, bus, lot, etc most which seem alright
+```
+
+observing large tokens
+```{r}
+clean_reviews_tokens %>% group_by(word) %>% summarise(token_length=str_length(word), total=n())%>% arrange(desc(token_length, total)) %>%unique()
+
+#manually observing the large tokens >16
+clean_reviews_tokens %>% filter(token_length>16) %>% arrange(desc(token_length))
+# we can remove all >17 and add recommendedations, recommendvstaying, girlslunchweekend to the custom list
+
+clean_reviews_tokens <- clean_reviews_tokens %>% filter(token_length<17)
+```
+
+### removing custom stopwords
+```{r}
+custom_sw_for_reviews <- tibble(word = c("bristol", "recommendedations", "recommendvstaying", "girlslunchweekend", "stay", "clifton"), type = "custom" )
+
+clean_reviews_tokens <- clean_reviews_tokens %>% anti_join(custom_sw_for_reviews)
+```
+1340050 tokens in total
+
+### Detokenising the clean tokens
+```{r}
+id_reviews <- clean_reviews_tokens %>% group_by(review_id) %>% summarise(detokenised_reviews = paste(word, collapse = " "))
+
+#retain all columns for further analysis
+listings_df <- lr_data_filtered %>% unique()
+
+# I use left join instead of directly assign id_reviews to listing_data is because they have different number of rows
+listings_clean_reviews_df = listings_df %>%
+  left_join(id_reviews) %>%
+  filter(!is.na(detokenised_reviews))
+
+```
+77467 reviews in total
+
+
+clearing memory
+```{r}
+remove(all_reviews_tokens, custom_sw_for_reviews, review_tokens_common_sw_removed, review_tokens_fry_200_removed, lem_reviews_tokens, lr_data, tf_idf_sw_for_reviews, id_reviews, listings_df, tf_idf_for_reviews)
+
+```
+
+
+
+## Descriptions - Pre-processing
+
+### Combining all descriptions 
+Define new_desc = (summary, space, neighborhood_overview, notes, transit, interaction, access, house_rules) - total 1723 listings
+```{r}
+#only listings with english descriptions
+all_descriptions = lr_data_filtered %>%
+  unite(new_desc, summary, space, neighborhood_overview, notes, transit, interaction, access, house_rules, sep = " ")
+
+all_descriptions <- all_descriptions[,1:99] %>% unique()
+```
+1809 listings in total
+
+
+remove NA (because we have combined all columns that are related to property descriptions, some columns have missing values, so we are removing those useless "NA" from the whole descriptions)
+```{r}
+all_descriptions$new_desc = gsub("NA", "", all_descriptions$new_desc)
+```
+
+### Language detection
+The Textcat library
+```{r}
+all_descriptions$new_desc = iconv(all_descriptions$new_desc) 
+
+all_descriptions$new_desc_lang_textcat = textcat(all_descriptions$new_desc)
+```
+
+The cld2 library
+```{r}
+all_descriptions = all_descriptions %>%
+  mutate(new_desc_lang_cld2 = detect_language(new_desc))
+```
+
+```{r}
+all_descriptions[which(all_descriptions$new_desc_lang_textcat == "english" & all_descriptions$new_desc_lang_cld2 != "en"),]
+
+#checking the comments that were predicted as english by cld2 but not textcat.
+all_descriptions[which(all_descriptions$new_desc_lang_textcat != "english" & all_descriptions$new_desc_lang_cld2 == "en"),]
+```
+these 5 descriptions are incorrectly classified by textcat, although they are in english. so we retain the listings identified as english by either packages.
+```{r}
+all_descriptions = all_descriptions %>%
+  filter(new_desc_lang_textcat == "english" | new_desc_lang_cld2 == "en")
+```
+1798 listings in total
+
+### Contraction removal
+```{r}
+all_descriptions$no_contraction_desc <- replace_contraction(all_descriptions$new_desc, key_contractions)
+```
+
+
+### Remove short descriptions
+The distribution shows there are many listings with more than 5 words in descriptions, we remove the listings with short descriptions as they do not give much information. 
+```{r}
+all_descriptions$number_of_words <- stringr::str_count(all_descriptions$no_contraction_desc, "\\b[A-Za-z]+\\b")
+
+
+hist(all_descriptions$number_of_words, breaks = 200, main = "Number of words per description")
+```
+
+```{r}
+all_descriptions_filtered = all_descriptions %>%
+  filter(number_of_words >= 10)
+```
+we finally have 1794 listings
+
+### Removing spaces before or after the entire texts
+```{r}
+all_descriptions_filtered$trimmed_desc = str_trim(all_descriptions_filtered$no_contraction_desc)
+```
+
+### add a period/space after fullstops. 
+in some reviews there is a pattern where period is missing after fullstops. single token will be generated in the place of two
+
+```{r}
+all_descriptions_filtered$spaced_desc = gsub("\\.(?=[A-Za-z])", ". ", all_descriptions_filtered$trimmed_desc, perl = T)
+
+```
+
+### extract special characters!! All Punctuations, including exclaimation marks are extracted
+```{r}
+all_descriptions_filtered$number_of_punctuations = stringr::str_count(all_descriptions_filtered$spaced_desc,  "[[:punct:]]")
+
+all_descriptions_filtered$number_of_exclamations = stringr::str_count(all_descriptions_filtered$spaced_desc,  "[!]")
+
+all_descriptions_filtered$special_chars <- str_extract_all(all_descriptions_filtered$spaced_desc, "[[:punct:]]")
+all_descriptions_filtered$special_chars <- str_extract_all(all_descriptions_filtered$spaced_desc, "[!]")
+```
+
+
+
+### extract all the words with capital letters 
+```{r}
+all_descriptions_filtered$number_of_words_are_all_capital = stringr::str_count(all_descriptions_filtered$spaced_desc,  "\\b[A-Z][A-Z][A-Z]+\\b")
+
+all_descriptions_filtered$capital_words <- str_extract_all(all_descriptions_filtered$spaced_desc, "\\b[A-Z][A-Z][A-Z]+\\b")
+```
+
+```{r}
+saveRDS(all_descriptions_filtered, "all_descriptions_filtered.rds")
+```
+
+
+### Tokenisation
+```{r}
+all_desc_tokens <- all_descriptions_filtered %>%
+  unnest_tokens(output = word, input = spaced_desc)
+```
+
+### remove non-ascii characters
+```{r eval = FALSE}
+tools::showNonASCII(all_desc_tokens$word)
+```
+
+
+```{r}
+all_desc_tokens$word = str_trim(gsub("\u001a", " ", stringi::stri_enc_toascii(all_desc_tokens$word)))
+```
+
+```{r}
+tools::showNonASCII(all_desc_tokens$word)
+```
+
+
+### lemmatisation
+```{r}
+all_desc_tokens$lem_token <- lemmatize_words(all_desc_tokens$word)
+
+desc_lem_tokens <- all_desc_tokens %>% select(listing_id, lem_token)
+
+desc_lem_tokens <- desc_lem_tokens %>% rename(word = lem_token)
+
+desc_lem_tokens %>% group_by(word) %>% summarise(word_count = n()) %>% arrange(desc(word_count)) %>% top_n(10)
+
+```
+
+### Removing digits
+```{r}
+desc_lem_tokens$digit = str_detect(desc_lem_tokens$word, "[0-9]+")
+
+desc_lem_tokens = desc_lem_tokens %>%
+  filter(digit != T)
+```
+
+### Removing stop words
+Common stop words
+```{r}
+desc_common_stopwords_removed <- desc_lem_tokens %>% anti_join(stop_words)
+desc_common_stopwords_removed %>% 
+  group_by(word) %>% 
+  summarise(wordcount = n()) %>% 
+  arrange(desc(wordcount))
+```
+
+Fry200
+```{r}
+#now we remove fry200 stop words
+#tokens reduced from 2,609,470 to 1158176
+fry_df200 = as.data.frame(sw_fry_200)
+colnames(fry_df200) <- "word"
+
+desc_fry_200_removed = desc_lem_tokens %>% anti_join(fry_df200)
+
+desc_fry_200_removed %>% group_by(word) %>% summarise(wordcount = n()) %>% arrange(desc(wordcount))
+
+rm(fry_df200)
+```
+
+If using listing_id as the documents, there will be too many stop words
+```{r}
+desc_tfidf = desc_lem_tokens %>%
+  count(word, listing_id) %>%
+  bind_tf_idf(word, listing_id, n)
+
+desc_tfidf_stopwords = desc_tfidf %>%
+  filter(tf_idf < 0.0003) %>%
+  mutate(lexicon="tfidf") %>% 
+  select(word, lexicon) %>% 
+  distinct()
+```
+
+removing tf_idf stopwords after removing Fry's 200 most common words are removed.
+```{r}
+desc_clean_tokens <- desc_fry_200_removed %>% anti_join(desc_tfidf_stopwords)
+
+desc_clean_tokens %>% group_by(word) %>% summarise(wordcount = n()) %>% arrange(desc(wordcount))
+```
+
+### Removing abnormal tokens with length
+remove tokens with one alphabet
+```{r}
+desc_clean_tokens$token_length <- str_length(desc_clean_tokens$word)
+#observing single tokens
+desc_clean_tokens %>% filter(token_length==1) %>% group_by(word) %>% summarise(total=n()) %>% arrange(desc(total))
+
+#they don't contribute, can remove them
+#filtering tokens with one alphabet
+desc_clean_tokens <- desc_clean_tokens %>% filter(token_length>1)
+```
+
+observing tokens with 2 letters
+```{r}
+desc_clean_tokens %>% filter(token_length==2) %>% group_by(word) %>% summarise(num = n()) %>% arrange(desc(num))
+#there are above 384 words with 2 token length, which seem not important. WHAT ABT TV??? are we removing wi and fi - shoud we club them?
+#removing these tokens
+
+desc_clean_tokens <- desc_clean_tokens %>% filter(token_length>2 | word == "tv")
+```
+
+observing tokens with 3 letters
+```{r}
+desc_clean_tokens %>% filter(token_length==3) %>% group_by(word) %>% summarise(num = n()) %>% arrange(desc(num))
+#most seem alright
+```
+
+observing large tokens
+```{r}
+desc_clean_tokens %>% group_by(word) %>% summarise(token_length=str_length(word), total=n())%>% arrange(desc(token_length, total)) %>%unique()
+
+#manually observing the large tokens >16
+desc_clean_tokens %>% filter(token_length>16) %>% arrange(desc(token_length))
+# we can remove all >17 and add recommendedations, recommendvstaying, girlslunchweekend to the custom list
+
+desc_clean_tokens <- desc_clean_tokens %>% filter(token_length<17)
+```
+
+### removing custom stopwords
+```{r}
+desc_custom_sw <- tibble(word = c("bristol", "accommodation", "flat", "apartment", "room", "stay", "clifton"), type = "custom" )
+
+desc_clean_tokens <- desc_clean_tokens %>% anti_join(desc_custom_sw)
+```
+
+
+
+
+### Detokenising the clean tokens
+```{r}
+id_desc <- desc_clean_tokens %>% group_by(listing_id) %>% summarise(detokenised_desc = paste(word, collapse = " "))
+
+# I retain all columns for further analysis
+listing_desc_data <- all_descriptions_filtered %>% unique()
+
+# I use left join instead of directly assign id_reviews to listing_data is because they have different number of rows
+listing_desc_data = listing_desc_data %>%
+  left_join(id_desc) %>%
+  filter(!is.na(detokenised_desc)) %>%
+  left_join(lr_data_filtered[,1:106] %>% unique())
+```
+1794 listings in total
+
+
+clearing memory
+```{r}
+remove(all_desc_tokens, desc_common_stopwords_removed, desc_custom_sw, desc_fry_200_removed, desc_lem_tokens, desc_tfidf_stopwords, id_desc, desc_tfidf, all_descriptions)
+
+```
+
+
+
+---------------------------------------------------------------------------------------
+######============================ Data Preprocessing ended ============================######
+---------------------------------------------------------------------------------------
+
+
+
+## Question 1a
+Question: What are the dominant words per aggregation category (neighborhood, access to public transport etc.)?
+
+### Find aggregation categories
+```{r}
+View(listings_clean_reviews_df[,1:106] %>%
+  unique())
+```
+Consider *neighbourhood_cleansed*, *host_is_superhost*, *property_type*, *room_type*, *bed_type*, and *cancellation_policy*
+
+
+### Agg. category1 - neighbourhood_cleansed
+```{r}
+listings_clean_reviews_df %>% select(neighbourhood_cleansed) %>% unique()
+```
+There are 34 categories in the neighborhood_cleansed column. Here, we will find top 10 words for each of the top 5 most popular neighborhoods in this column.
+
+#### Get top 5 neighborhoods in "neighborhood_cleansed"
+```{r}
+listings_clean_reviews_df %>%
+  select(listing_id, neighbourhood_cleansed) %>%
+  unique() %>%
+  group_by(neighbourhood_cleansed) %>%
+  summarise(total = n()) %>%
+  arrange(desc(total)) %>%
+  top_n(5, total) %>%
+  select(neighbourhood_cleansed) %>%
+  as.character()
+```
+The top 5 most popular neighborhoods are "Ashley", "Central", "Clifton", "Lawrence Hill", and "Clifton Down". These areas had the most listings in descending order.
+
+#### Get top 10 words from customers' reviews for each neighborhood
+
+```{r}
+listings_clean_reviews_df %>%
+  left_join(clean_reviews_tokens) %>%
+  filter(neighbourhood_cleansed %in% c("Ashley", "Central", "Clifton", "Lawrence Hill", "Clifton Down")) %>%
+  count(neighbourhood_cleansed, word) %>%
+  group_by(neighbourhood_cleansed) %>%
+  arrange(neighbourhood_cleansed, desc(n)) %>%
+  top_n(10, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = neighbourhood_cleansed), stat = "identity") + facet_wrap(~neighbourhood_cleansed, ncol = 1, scales = "free") + labs(title = "Top 10 words in the reviews in 5 most popular neighbourhoods")
+```
+
+#### Get top 10 words in the reviews of dissatisfied vs satisfied customers in the most popular neighborhoods
+```{r}
+#defining the satified customers as ones whose review rating scores are >94
+
+rating_categories = listings_clean_reviews_df %>%
+  group_by(listing_id) %>%
+  summarise(avg_rating = mean(review_scores_rating)) %>%
+  select(listing_id, avg_rating) %>%
+  mutate(rating_category = ifelse(avg_rating<94.47,1,2))
+  
+
+listings_ratings <- listings_clean_reviews_df %>% left_join(rating_categories)
+
+
+listings_ratings %>%
+  left_join(clean_reviews_tokens) %>%
+  filter(neighbourhood_cleansed %in% c("Ashley", "Central", "Clifton", "Lawrence Hill", "Clifton Down"), rating_category ==1) %>% 
+  count(neighbourhood_cleansed, word) %>%
+  group_by(neighbourhood_cleansed) %>%
+  arrange(neighbourhood_cleansed, desc(n)) %>%
+  top_n(5, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = neighbourhood_cleansed), stat = "identity") + facet_wrap(~neighbourhood_cleansed, ncol = 1, scales = "free") + labs(title = "Top 10 words in the reviews of dissatisfied customers")
+
+```
+
+
+
+#### Get top 10 words from hosts' descriptions for each neighborhood
+```{r}
+listing_desc_data %>%
+  left_join(desc_clean_tokens) %>%
+  filter(neighbourhood_cleansed %in% c("Ashley", "Central", "Clifton", "Lawrence Hill", "Clifton Down")) %>%
+  count(neighbourhood_cleansed, word) %>%
+  group_by(neighbourhood_cleansed) %>%
+  arrange(neighbourhood_cleansed, desc(n)) %>%
+  top_n(10, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = neighbourhood_cleansed), stat = "identity") + facet_wrap(~neighbourhood_cleansed, ncol = 1, scales = "free") + labs(title = "Top 10 words used in the descriptions in 5 most popular neighbourhoods")
+```
+
+### Agg. category2 - property_type
+```{r}
+listings_clean_reviews_df %>% select(property_type) %>% unique()
+```
+There are 22 categories in the property_type column. Here, we will find top 10 words for each of the top 5 property types in this column. i.e., these property types have the most number of listings.
+
+#### Get top 5 property types in "property_type"
+```{r}
+listings_clean_reviews_df %>%
+  select(listing_id, property_type) %>%
+  unique() %>%
+  group_by(property_type) %>%
+  summarise(total = n()) %>%
+  arrange(desc(total)) %>%
+  top_n(5)
+``` 
+  
+  
+The top 5 most popular property types are "Apartment", "House", "Townhouse", "Serviced apartment", and "Condominium".
+
+#### Get top 10 words from customers' descriptions for each property type
+```{r}
+listings_clean_reviews_df %>%
+  left_join(clean_reviews_tokens) %>%
+  filter(property_type %in% c("Apartment", "House", "Townhouse", "Serviced apartment", "Condominium")) %>%
+  count(property_type, word) %>%
+  group_by(property_type) %>%
+  arrange(property_type, desc(n)) %>%
+  top_n(10, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = property_type), stat = "identity") + facet_wrap(~property_type, ncol = 1, scales = "free") + labs(title = "Top 10 words in the reviews in 5 property types")
+
+
+```
+
+```{r}
+listing_desc_data %>%
+  left_join(desc_clean_tokens) %>%
+  filter(property_type %in% c("Apartment", "House", "Townhouse", "Serviced apartment", "Condominium")) %>%
+  count(property_type, word) %>%
+  group_by(property_type) %>%
+  arrange(property_type, desc(n)) %>%
+  top_n(10, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = property_type), stat = "identity") + facet_wrap(~property_type, ncol = 1, scales = "free") + labs(title = "Top 10 words used in the descriptions in 5 most property types")
+
+
+```
+
+### Agg. category3 - host_is_superhost
+```{r}
+listings_clean_reviews_df %>% select(host_is_superhost) %>% unique()
+```
+There are 2 categories in the host_is_superhost column. Here, we will find top 10 words for each categories in this column.
+
+#### Get top 10 words from customers' reviews for each category
+```{r}
+listings_clean_reviews_df %>%
+  left_join(clean_reviews_tokens) %>%
+  count(host_is_superhost, word) %>%
+  group_by(host_is_superhost) %>%
+  arrange(host_is_superhost, desc(n)) %>%
+  top_n(10, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = host_is_superhost), stat = "identity") + facet_wrap(~host_is_superhost, ncol = 1, scales = "free") + labs(title = "Top 10 words in the comments from properties of Regular-hosts vs Super-hosts")
+```
+
+#### Get top 10 words from hosts' descriptions for each category
+```{r}
+listing_desc_data %>%
+  left_join(desc_clean_tokens) %>%
+  count(host_is_superhost, word) %>%
+  group_by(host_is_superhost) %>%
+  arrange(host_is_superhost, desc(n)) %>%
+  top_n(10, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = host_is_superhost), stat = "identity") + facet_wrap(~host_is_superhost, ncol = 1, scales = "free") + labs(title = "Top 10 words in the comments from properties of Regular-hosts vs Super-hosts")
+```
+
+### Agg. Category4 - room_type
+```{r}
+listings_clean_reviews_df %>% select(room_type) %>% unique()
+```
+There are 4 categories in the room_type column. Here, we will find top 10 words for each categories in this column.
+
+#### Get top 10 words from customers' reviews for each room type
+```{r}
+listings_clean_reviews_df %>%
+  left_join(clean_reviews_tokens) %>%
+  count(room_type, word) %>%
+  group_by(room_type) %>%
+  arrange(room_type, desc(n)) %>%
+  top_n(10, n) %>% 
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = room_type), stat = "identity") + facet_wrap(~room_type, ncol = 1, scales = "free") + labs(title = "Top 10 words in the descriptions for each room type")
+```
+
+#### Get top 10 words from hosts' descriptions for each room type
+```{r}
+listing_desc_data %>%
+  left_join(desc_clean_tokens) %>%
+  count(room_type, word) %>%
+  group_by(room_type) %>%
+  arrange(room_type, desc(n)) %>%
+  top_n(5, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = room_type), stat = "identity") + facet_wrap(~room_type, ncol = 1, scales = "free") + labs(title = "Top 10 words in the reviews for each room type")
+```
+
+### Agg. Category5 - bed_type
+```{r}
+listings_clean_reviews_df %>% select(bed_type) %>% unique()
+```
+There are 4 categories in the bed_type column. Here, we will find top 10 words for each categories in this column.
+
+#### Get top 10 words from customers' reviews for each bed type
+```{r}
+listings_clean_reviews_df %>%
+  left_join(clean_reviews_tokens) %>%
+  count(bed_type, word) %>%
+  group_by(bed_type) %>%
+  arrange(bed_type, desc(n)) %>%
+  top_n(10, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = bed_type), stat = "identity") + facet_wrap(~bed_type, ncol = 1, scales = "free") + labs(title = "Top 10 words in the reviews for each bed type")
+```
+#### Get top 10 words from hosts' descriptions for each bed type
+```{r}
+listing_desc_data %>%
+  left_join(desc_clean_tokens) %>%
+  count(bed_type, word) %>%
+  group_by(bed_type) %>%
+  arrange(bed_type, desc(n)) %>%
+  top_n(10, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = bed_type), stat = "identity") + facet_wrap(~bed_type, ncol = 1, scales = "free") + labs(title = "Top 10 words in the descriptions of properties with different bed type")
+```
+
+### Agg. Category6 - cancellation_policy
+```{r}
+listings_clean_reviews_df %>% select(cancellation_policy) %>% unique()
+```
+There are 5 categories in the cancellation_policy column. Here, we will find top 10 words for each categories in this column.
+
+#### Get top 10 words from customers' reviews for each cancellation policy
+```{r}
+listings_clean_reviews_df %>%
+  left_join(clean_reviews_tokens) %>%
+  count(cancellation_policy, word) %>%
+  group_by(cancellation_policy) %>%
+  arrange(cancellation_policy, desc(n)) %>%
+  top_n(10, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = cancellation_policy), stat = "identity") + facet_wrap(~cancellation_policy, ncol = 1, scales = "free") + labs(title = "Top 10 words in the reviews for properties with different cancellation policy")
+```
+#### Get top 10 words from hosts' descriptions for each cancellation policy
+```{r}
+listing_desc_data %>%
+  left_join(desc_clean_tokens) %>%
+  count(cancellation_policy, word) %>%
+  group_by(cancellation_policy) %>%
+  arrange(cancellation_policy, desc(n)) %>%
+  top_n(5, n) %>%
+  ggplot() +
+  geom_bar(aes(x = word, y=n, fill = cancellation_policy), stat = "identity") + facet_wrap(~cancellation_policy, ncol = 1, scales = "free") + labs(title = "Top 5 words in descriptions of properties with different cancellation policy")
+```
+
+
+----------------------------------------------------------------------------
+######==================Question 1a Ended==================######
+----------------------------------------------------------------------------
+
+
+## Question 1b: What are the most common word combinations used to describe a property listing?
+Both descriptions and comments can describe a property
+
+1. Find the most common word from all descriptions and comments
+2. Get the word combination by calculating correlations between the most common term and the other words.
+
+### Descriptions (texts from hosts)
+####Find the most common word
+```{r}
+desc_clean_tokens %>%
+  count(word) %>%
+  arrange(desc(n))
+```
+It shows the most common word is "please". Let's find its associated words.
+#### Find associated words
+```{r}
+desc_dtm = desc_clean_tokens %>%
+  count(word, listing_id) %>%
+  cast_dtm(listing_id, word, n)
+
+
+findAssocs(desc_dtm, "please", 0.3)$please
+
+```
+
+
+### Reviews
+####Find the most common word
+```{r}
+clean_reviews_tokens %>%
+  count(word) %>%
+  arrange(desc(n))
+```
+It shows the most common word is "lovely". Let's find its associated words.
+#### Find associated words
+```{r}
+review_dtm = clean_reviews_tokens %>%
+  count(word, listing_id) %>%
+  cast_dtm(listing_id, word, n)
+
+
+findAssocs(review_dtm, "lovely", 0.8)$lovely
+
+```
+
+```{r}
+rm(desc_dtm, review_dtm)
+```
+
+---------------------------------------------------------------------------------
+######====================Question 1b Ended====================######
+---------------------------------------------------------------------------------
+
+
+## Question 3: What variables can be extracted from the text that can be related with the rating score ?
+Only consider comments (descriptions are not related with the rating scores)
+
+variables extracted from the reviews, that might affect the review rating are -
+i. number of sentences in the review
+ii. polarity of the reviews, 
+iii. number of nouns, adverbs and adjectives used by the reviewer, 
+iv. number of exclamations, 
+v.number of words with capital letters
+
+
+### Reviews vs review_scores_rating
+#### Case 1: Satisfied and dissatisfied customers
+What group of words may lead to better a rating score?
+
+```{r}
+listings_stats <- listings %>% 
+  select(listing_id, price, review_scores_rating) %>%
+  na.omit() %>%
+  summarise(avg_rating = mean(review_scores_rating), 
+            std_rating = sd(review_scores_rating))
+
+rating_categories = listings %>%
+  filter(!is.na(review_scores_rating)) %>%
+  select(listing_id, review_scores_rating) %>%
+  mutate(rating_category = ifelse(review_scores_rating<94.47,1,2))
+  
+
+ratings_categories_tokens = clean_reviews_tokens %>%
+  left_join(rating_categories) %>%
+  group_by(rating_category, word) %>%
+  summarise(total = n())
+
+# Answers 1
+ratings_categories_tokens %>% filter(rating_category==1) %>% arrange(desc(total)) %>% top_n(10)
+ratings_categories_tokens %>% filter(rating_category==2) %>% arrange(desc(total)) %>% top_n(10)
+
+rm(rating_categories)
+
+```
+
+##### Word clouds
+Dissatisfied customers
+```{r}
+dissatisfied_words = ratings_categories_tokens %>% 
+            filter(rating_category==1)
+
+wordcloud(words = dissatisfied_words$word,
+          freq = dissatisfied_words$total,
+          max.words = 50,
+          colors = c("DarkOrange", "CornflowerBlue", "DarkRed"),
+          rot.per = 0.3)
+```
+Satisfied customers
+```{r}
+satisfied_words = ratings_categories_tokens %>% 
+            filter(rating_category==2)
+
+wordcloud(words = satisfied_words$word,
+          freq = satisfied_words$total,
+          max.words = 50,
+          colors = c("DarkOrange", "CornflowerBlue", "DarkRed"),
+          rot.per = 0.3)
+```
+THESE WORD CLOUDS DO NOT MAKE SENSE! HOW TO INTERPRET?
+
+```{r}
+rm(satisfied_words, dissatisfied_words, ratings_categories_tokens, listings_stats)
+```
+
+
+#### Case 2: word frequencies, bag-of-words corpus (bow)
+```{r}
+# we use top 50 common words to create bag-of-words corpus
+bow_terms = clean_reviews_tokens %>%
+  count(word) %>%
+  arrange(desc(n)) %>%
+  top_n(50, n)
+
+review_bow = clean_reviews_tokens %>% 
+  dplyr::select(listing_id, word) %>%
+  filter(word %in% bow_terms$word) %>%
+  count(listing_id, word) %>%
+  pivot_wider(names_from = word,
+              values_from = n,
+              values_fill = 0)
+#1721 listings here, these words are not present in reviews of 2 listings
+#adding 0 in the rows without these words
+
+review_bow = review_bow %>%
+  left_join(listings %>% dplyr::select(listing_id, review_scores_rating) %>% na.omit()) %>%
+  na.omit()
+
+```
+
+```{r}
+model_test = lm(review_scores_rating~., data = review_bow %>% select(-listing_id))
+model_test = MASS::stepAIC(model_test, direction = "backward")
+summary(model_test)
+
+model_test_coefficients = as.data.frame(summary(model_test)$coefficients)
+colnames(model_test_coefficients) = c("Estimate", "Std_Error", "t_value", "p_value")
+model_test_coefficients %>%
+  filter(p_value < 0.05) %>% 
+  row.names()
+```
+
+Terms "amaze", "apartment", "area", "bed", "breakfast", "check", "close", "comfortable", "definitely", "feel", "kitchen", "location", "night", "recommend", "room", and "thank" are significant.
+
+```{r}
+rm(bow_terms, model_test, model_test_coefficients, listings_ratings)
+```
+
+
+
+#### Case 3: Average number of sentences for each review
+```{r}
+lr_data_filtered = lr_data_filtered %>%
+  mutate(number_of_sentences = nsentence(comments)) 
+
+nsents_vs_rating = lr_data_filtered %>%
+  select(listing_id, review_scores_rating, number_of_sentences) %>% 
+  na.omit() %>% 
+  group_by(listing_id, review_scores_rating) %>%
+  summarise(avg_num_of_sents = mean(number_of_sentences))
+```
+
+```{r}
+model_test = lm(review_scores_rating~avg_num_of_sents, data = nsents_vs_rating)
+
+summary(model_test)
+```
+The adjusted R-squared is very low but the coefficient is significant.
+
+```{r}
+rm(model_test)
+```
+
+#### Case 4: Is mentioning host's name in the review important?
+```{r}
+lr_data_filtered = lr_data_filtered %>%
+  mutate(num_host_mentioned = str_count(comments, pattern = host_name))
+
+nhost_mentioned = lr_data_filtered %>%
+  select(listing_id, review_scores_rating, num_host_mentioned) %>%
+  na.omit() %>%
+  group_by(listing_id, review_scores_rating) %>%
+  summarise(avg_host_mentioned = mean(num_host_mentioned))
+```
+
+```{r}
+model_test = lm(review_scores_rating~avg_host_mentioned, data = nhost_mentioned)
+
+summary(model_test)
+```
+The adjusted R-squared is low but the coefficient is quite significant. 
+
+```{r}
+rm(model_test)
+```
+
+#### Case 5: number of punctuations
+1. Punctuation
+```{r}
+n_punctuation = lr_data_filtered %>%
+  select(listing_id, review_scores_rating, number_of_punctuations) %>%
+  na.omit() %>%
+  group_by(listing_id, review_scores_rating) %>%
+  summarise(avg_num_puncts = mean(number_of_punctuations))
+```
+
+```{r}
+model_test = lm(review_scores_rating~avg_num_puncts, data = n_punctuation)
+
+summary(model_test)
+```
+The coefficient is not significant.
+
+```{r}
+rm(model_test)
+```
+
+2. Exclamations
+```{r}
+n_exclamations = lr_data_filtered %>%
+  select(listing_id, review_scores_rating, number_of_exclamations) %>%
+  na.omit() %>%
+  group_by(listing_id, review_scores_rating) %>%
+  summarise(avg_num_exclamations = mean(number_of_exclamations))
+```
+
+```{r}
+model_test = lm(review_scores_rating~avg_num_exclamations, data = n_exclamations)
+
+summary(model_test)
+```
+The adjusted R squared is low but the coefficient is quite significant.
+
+```{r}
+rm(model_test)
+```
+
+
+#### Case 6: number of capital words
+```{r}
+n_capital_words = lr_data_filtered %>%
+  select(listing_id, review_scores_rating, number_of_words_are_all_capital) %>%
+  na.omit() %>%
+  group_by(listing_id, review_scores_rating) %>%
+  summarise(avg_num_capital = mean(number_of_words_are_all_capital))
+```
+
+```{r}
+model_test = lm(review_scores_rating~avg_num_capital, data = n_capital_words)
+
+summary(model_test)
+```
+The adjusted R squared is quite low but the coefficient is significant.
+
+```{r}
+rm(model_test)
+```
+
+
+
+#### Case 8 - Final - using all the above variables as predictors, we run the model again
+
+```{r}
+
+combined_vars <- review_bow %>%
+  dplyr::select(-review_scores_rating) %>%
+  left_join(n_capital_words %>% dplyr::select(-review_scores_rating)) %>%
+  left_join(n_exclamations %>% dplyr::select(-review_scores_rating)) %>%
+  left_join(n_punctuation %>% dplyr::select(-review_scores_rating)) %>%
+  left_join(nhost_mentioned %>% dplyr::select(-review_scores_rating)) %>%
+  left_join(nsents_vs_rating)
+
+ 
+model_test = lm(review_scores_rating ~., data = combined_vars %>% dplyr::select(-listing_id))
+
+model_test = MASS::stepAIC(model_test, direction = "backward")
+
+summary(model_test)
+model_test_coefficients = as.data.frame(summary(model_test)$coefficients)
+colnames(model_test_coefficients) = c("Estimate", "Std_Error", "t_value", "p_value")
+model_test_coefficients %>%
+  filter(p_value < 0.05) %>% 
+  row.names()
+```
+The adjusted R2 is 24%, very low but this is significantly higher than using individual predictors. Terms "beautiful", "bed", "check", "comfortable", "feel", "flat", "location", "nice", "night", "recommend" and "room" are significant. Also, number of capital words, number of exclamations, number of punctuations, and number of host name mentioned are significant. Only **number of sentences** is not significant.
+
+```{r}
+rm(model_test, model_test_coefficients, n_capital_words, n_exclamations, n_punctuation, nhost_mentioned, nsents_vs_rating, review_bow)
+```
+
+
+
+---------------------------------------------------------------------------------
+######====================Question 1c Ended====================######
+---------------------------------------------------------------------------------
+
+
+## Question 1d: Using the textual description of the property supplied by the owner, how does this relate with the price that the property is listed for rent?
+
+we derive variables from the description of the property -  
+i. word count 
+ii. readability - Flesch.Kinciad score, FK_grd.lvl, ARI index, Linsear.Write scores
+iii. formality
+iv. number of negative words 
+v. number of p.o.s words 
+vi. lexical diversity
+vii. polarity
+viii. amenities - what are the important amenities that distinguish the properties?
+ix. formality of host description about himself - host_about
+x. age of the host
+xi. number of host verifications
+
+
+we use these elements to predict the price and review_rating
+
+readability indices- 
+"ARI": Automated Readability Index (Senter and Smith 1967)
+0.5ASL + 4.71AW L − 21.34
+
+"Flesch.Kincaid": Flesch-Kincaid Readability Score (Flesch and Kincaid 1975).
+0.39 × ASL + 11.8 × (nsy/nw)− 15.59
+
+"Linsear.Write": Linsear Write (Klare 1975).
+[(100 − (100×nwsy<3/nw)) + (3 ×100×nwsy>=3nw)] / (100 × (nst/nw))
+
+where nwsy<3 = Nwless3sy = the number of words with less than 3 syllables, and nwsy>=3 =
+Nwmin3sy = the number of words with 3-syllables or more. The scaling by 100 arises because
+the original Linsear.Write measure is based on just a sample of 100 words)
+
+```{r}
+all_descriptions_filtered$price = as.numeric(gsub("\\$","",all_descriptions_filtered$price))
+```
+
+### Readability
+```{r}
+
+desc_readability_df <- quanteda.textstats::textstat_readability(all_descriptions_filtered$new_desc, measure = c("ARI", "Flesch.Kincaid", "Linsear.Write" ), remove_hyphens = FALSE)
+
+desc_readability_df <- cbind(listing_id = all_descriptions_filtered$listing_id, price = all_descriptions_filtered$price, desc_readability_df) %>% na.omit()
+
+```
+
+```{r}
+model_test <- lm(log(price) ~. , data = desc_readability_df[,-c(1,3)])
+summary(model_test)
+```
+The adjusted R2 is low and ARI is not significant in predicting price
+
+```{r}
+rm(model_test)
+```
+
+
+### Formality and word count
+```{r eval=FALSE}
+desc_formality_df <- formality(all_descriptions_filtered$new_desc, all_descriptions_filtered$listing_id)
+
+saveRDS(desc_formality_df, "desc_formality_df.rds")
+```
+
+```{r}
+desc_formality_df = readRDS("desc_formality_df.rds")
+
+desc_formality_df <- cbind(desc_formality_df$formality, price = all_descriptions_filtered$price) %>% as.data.frame() %>% na.omit()
+
+desc_formality_df$listing_id = as.numeric(desc_formality_df$listing_id)
+
+```
+
+```{r}
+model_test <- lm(log(price)~word.count, data = desc_formality_df)
+summary(model_test)
+
+model_test <- lm(log(price)~formality, data = desc_formality_df)
+summary(model_test)
+```
+Formality is a significant predictor of price, not word count.
+
+### Lexical diversity
+```{r}
+desc_diversity_df <- diversity(all_descriptions_filtered$new_desc, all_descriptions_filtered$listing_id)
+
+desc_diversity_df <- cbind(desc_diversity_df, price = all_descriptions_filtered$price) %>% as.data.frame() %>% na.omit()
+desc_diversity_df$listing_id <- as.numeric(desc_diversity_df$listing_id)
+```
+
+```{r}
+model_test <- lm(log(price) ~. , data = desc_diversity_df[,-1])
+summary(model_test)
+
+```
+
+Only simpson is significant, adjusted r2 is very less
+
+### Polarity
+calculating polarity of descriptions of each listing using qdap::polarity function
+```{r}
+desc_polarity_df <- polarity(all_descriptions_filtered$new_desc, grouping.var = all_descriptions_filtered$listing_id)
+
+
+#we can extract negative words from this and model it
+```
+
+```{r}
+desc_polarity_df <- cbind(desc_polarity_df$all, price = all_descriptions_filtered$price) %>% as.data.frame() %>% na.omit()
+```
+
+```{r}
+model_test <- lm(log(price) ~ polarity, data = desc_polarity_df)
+summary(model_test)
+```
+polarity is not significant
+
+### Num of p.o.s words in descriptions
+```{r}
+
+desc_polarity_df$n_pos_words <- lengths(desc_polarity_df$pos.words)
+
+model_test <- lm(log(price) ~ n_pos_words, data = desc_polarity_df)
+summary(model_test)
+
+```
+number of pos words in the description is a significant predictor
+
+### Num of negative words in descriptions
+```{r}
+
+desc_polarity_df$n_negative_words <- lengths(desc_polarity_df$neg.words)
+
+model_test <- lm(log(price) ~ n_negative_words, data = desc_polarity_df)
+summary(model_test)
+
+```
+number of negative words in the description is also a significant predictor of price
+
+
+### Num of exclaimations in descriptions
+```{r}
+desc_exclaimations_df <- all_descriptions_filtered %>% dplyr::select(listing_id, price, number_of_exclamations) %>% na.omit()
+
+model_test <- lm(log(price) ~ number_of_exclamations, data = desc_exclaimations_df)
+summary(model_test)
+```
+Not significant
+
+### num of punctuations
+
+```{r}
+desc_punctuations_df <- all_descriptions_filtered %>% dplyr::select(listing_id, price, number_of_punctuations) %>% na.omit()
+
+model_test <- lm(log(price) ~ number_of_punctuations, data = desc_punctuations_df)
+summary(model_test)
+
+```
+Significant
+
+### num of capitals
+
+```{r}
+desc_capitals_df <- all_descriptions_filtered %>% dplyr::select(listing_id, price, number_of_words_are_all_capital) %>% na.omit()
+
+model_test <- lm(log(price) ~ number_of_words_are_all_capital, data = desc_capitals_df)
+summary(model_test)
+
+```
+Not significant
+
+### Host verifications
+```{r}
+host_verifications_df <- all_descriptions_filtered %>% dplyr::select(listing_id, price, host_verifications, host_since) %>% as.data.frame() %>% na.omit()
+
+host_verifications_df$num_verifications <- host_verifications_df$host_verifications %>% str_remove_all("\\[\\'|\\'\\]") %>% str_split("', '") %>% lengths()
+
+model_test <- lm(log(price)~num_verifications, data = host_verifications_df)
+summary(model_test)
+
+
+
+```
+Significant
+
+### Age of host
+```{r}
+d <- as.Date("2020-02-27")
+for (i in 1:nrow(host_verifications_df)){
+  host_verifications_df$host_age_in_months[i] = as.numeric((d - host_verifications_df$host_since[i])*12/365) }
+
+model_test <- lm(log(price)~host_age_in_months, data = host_verifications_df)
+summary(model_test)
+
+
+rm(d, i)
+```
+Significant
+
+### Amenities 
+```{r}
+amenities = all_descriptions_filtered %>% dplyr::select(listing_id, amenities) %>% 
+  unique()
+
+amenities$cleaned_amenities = gsub('[{}]', " ", amenities$amenities)
+
+amenities = amenities %>% dplyr::select(listing_id, cleaned_amenities)
+
+
+
+atomic_amenities = data.table(amenities)
+
+atomic_amenities = atomic_amenities[ , list( name = unlist( strsplit( cleaned_amenities , "," ) ) ) , by = list( listing_id ) ]
+
+atomic_amenities$clean_amenities <- str_trim(gsub('["]', "", atomic_amenities$name))
+
+
+atomic_amenities$small_letter_amenity = tolower(atomic_amenities$clean_amenities) 
+atomic_amenities$count = 1
+
+atomic_amenities = atomic_amenities %>%
+  dplyr::select(listing_id, small_letter_amenity, count) %>%
+  unique()
+
+cleaned_amenities = atomic_amenities %>%
+  pivot_wider(names_from = small_letter_amenity,
+              values_from = count,
+              values_fill = 0)
+
+rm(amenities, atomic_amenities)
+```
+
+Combining the price
+```{r}
+amenities_prices <- cleaned_amenities %>%
+  left_join(all_descriptions_filtered %>% dplyr::select(listing_id, price)) %>% na.omit()
+
+rm(amenities, atomic_amenities, cleaned_amenities)
+```
+
+```{r}
+model_test = lm(log(price)~., data = amenities_prices %>% dplyr::select(-listing_id))
+
+amenities_result = summary(model_test)
+
+amenities_result = as.data.frame(amenities_result$coefficients) 
+colnames(amenities_result)[4] = "p_value"
+( amenities_result = amenities_result %>%
+  filter(p_value  < 0.05) %>%
+  arrange(desc(Estimate)) )
+
+rm(model_test)
+```
+
+
+### combining all above variables as price predictors
+
+```{r}
+
+#desc_predictors <- cbind(amenities_prices,
+ #                        readability_ARI = desc_readability_df$ARI,
+  #                       readability_FK = desc_readability_df$Flesch.Kincaid,
+   #                      readability_LW = desc_readability_df$Linsear.Write,
+    #                     word_count = desc_formality_df$word.count,
+     #                    formality = desc_formality_df$formality,
+      #                   polarity = desc_polarity_df$polarity,
+       #                  n_neg_words = lengths(desc_polarity_df$neg.words),
+        #                 n_pos_words = lengths(desc_polarity_df$pos.words),
+         #                n_exclamations = desc_exclaimations_df$number_of_exclamations,
+          #               n_punctuations = desc_punctuations_df$number_of_punctuations,
+           #              n_capitals = desc_capitals_df$number_of_words_are_all_capital,
+            #            diversity_berger_parker = desc_diversity_df$berger_parker,
+             #            diversity_simpson = desc_diversity_df$brillouin,
+              #           n_host_verifications = host_verifications_df$num_verifications,
+               #          age_host_mths = host_verifications_df$host_age_in_months)
+
+desc_predictors <- desc_punctuations_df %>%
+  dplyr::select(-price) %>% 
+  inner_join(desc_capitals_df %>% dplyr::select(-price)) %>% 
+  inner_join(desc_readability_df %>% dplyr::select(-price, -document)) %>%
+  inner_join(desc_polarity_df %>% dplyr::select(-text.var, -price, -pos.words, -neg.words, -wc)) %>%
+  inner_join(desc_exclaimations_df %>% dplyr::select(-price)) %>%
+  inner_join(host_verifications_df %>% dplyr::select(-price, -host_verifications, -host_since)) %>%
+  inner_join(desc_formality_df%>% dplyr::select(-price)) %>%
+  inner_join(desc_diversity_df %>% dplyr::select(-price, -wc), by = "listing_id") %>% 
+  inner_join(amenities_prices)
+```
+
+
+```{r eval = FALSE}
+model_test <- lm(log(price) ~ ., data = subset(desc_predictors, select = c(-listing_id)))
+model_test = MASS::stepAIC(model_test, direction = "backward")
+summary(model_test)
+
+
+saveRDS(model_test, "PartA_all_variables_vs_price_model.rds")
+```
+
+
+```{r}
+model_test = readRDS("PartA_all_variables_vs_price_model.rds")
+
+model_test_coefficients = as.data.frame(summary(model_test)$coefficient)
+colnames(model_test_coefficients)[4] = "p_value"
+sig_model_test_coefficients = model_test_coefficients %>%
+  filter(p_value < 0.05) 
+
+# all significant variables
+row.names(sig_model_test_coefficients)
+```
+
+adjusted R2 is 49.4% and 47 variables are significant.
+
+```{r}
+rm(amenities_prices, amenities_result, desc_capitals_df, desc_diversity_df, desc_exclaimations_df, desc_formality_df, desc_polarity_df, desc_punctuations_df, desc_readability_df, host_verifications_df, model_test, model_test_coefficients, sig_model_test_coefficients)
+```
+
+-----------------------------------------------------------------------------------
+######==================================End PartA==================================######
+-----------------------------------------------------------------------------------
+
+
+# Part B
+
+## 1. Calculating the reviews' sentiment on listing level
+```{r}
+
+#Bing Liu dictionary
+
+reviews_sentiment_bing_liu <- clean_reviews_tokens %>% 
+  inner_join(get_sentiments("bing")) %>%
+  count(sentiment,listing_id) %>% spread(sentiment,n) %>%
+  mutate(bing_liu_sentiment = positive-negative) %>%
+  dplyr::select(listing_id,bing_liu_sentiment) %>%
+  filter(!is.na(bing_liu_sentiment))
+
+
+
+# NRC Dictionary 
+
+reviews_sentiments_nrc <- clean_reviews_tokens %>% inner_join(get_sentiments("nrc")) %>%  count(sentiment,listing_id) %>% spread(sentiment,n) %>% mutate(sentiment_nrc = positive-negative) %>% dplyr::select(listing_id, sentiment_nrc) %>% filter(!is.na(sentiment_nrc))
+
+
+
+# Afinn Dictionary
+reviews_sentiment_affin <- clean_reviews_tokens %>% inner_join(get_sentiments("afinn")) %>% group_by(listing_id) %>% summarise(sentiment_affin = sum(value)) %>% filter(!is.na(sentiment_affin))
+
+
+
+# Loughran Dictionary
+
+reviews_sentiments_loughran <- clean_reviews_tokens %>% inner_join(get_sentiments("loughran")) %>% count(sentiment,listing_id) %>%  spread(sentiment,n) %>%  mutate(sentiment_loughran = positive-negative) %>% dplyr::select(listing_id,sentiment_loughran) %>% filter(!is.na(sentiment_loughran))
+ 
+
+```
+
+### combine all reviews sentiments
+```{r}
+all_review_sentiments <- reviews_sentiment_bing_liu %>% 
+  inner_join(reviews_sentiments_nrc) %>%
+  inner_join(reviews_sentiment_affin) %>%
+  inner_join(reviews_sentiments_loughran) 
+
+rm(reviews_sentiment_affin, reviews_sentiment_bing_liu, reviews_sentiments_loughran, reviews_sentiments_nrc)
+
+all_review_sentiments = all_review_sentiments %>%
+  left_join(listings %>% dplyr::select(listing_id, review_scores_rating)) %>% na.omit()
+```
+
+
+
+
+
+```{r}
+ggplot(all_review_sentiments, aes(x = review_scores_rating, y= bing_liu_sentiment)) + geom_point() + geom_smooth(method = "lm")
+
+```
+
+
+## 2. Calculating sentiments of the listing descriptions - on listing level
+only sentiment score
+```{r}
+#Bing Liu dictionary
+
+desc_sentiments_bing_liu <- desc_clean_tokens %>% 
+  inner_join(get_sentiments("bing")) %>%
+  count(sentiment,listing_id) %>% spread(sentiment,n) %>%
+  mutate(desc_bing_liu_sentiment = positive-negative) %>%
+  dplyr::select(listing_id,desc_bing_liu_sentiment) %>% filter(!is.na(desc_bing_liu_sentiment))
+
+
+
+# Afinn Dictionary
+desc_sentiments_affin <- desc_clean_tokens %>% inner_join(get_sentiments("afinn")) %>% group_by(listing_id) %>% summarise(desc_sentiment_affin = sum(value)) %>% filter(!is.na(desc_sentiment_affin))
+
+# Loughran Dictionary
+
+desc_sentiments_loughran <- desc_clean_tokens %>% inner_join(get_sentiments("loughran")) %>% count(sentiment,listing_id) %>%  spread(sentiment,n) %>%  mutate(desc_sentiment_loughran = positive-negative) %>% dplyr::select(listing_id, desc_sentiment_loughran) %>% filter(!is.na(desc_sentiment_loughran))
+
+```
+
+Extracting the feelings of the listing descriptions and sentiment score
+```{r}
+# NRC Dictionary 
+
+desc_sentiments_nrc <- desc_clean_tokens %>% inner_join(get_sentiments("nrc")) %>%  count(sentiment,listing_id) %>% spread(sentiment,n) %>% 
+  mutate(desc_sentiment_nrc = positive-negative) %>% 
+  dplyr::select(listing_id, desc_sentiment_nrc) %>%
+  filter(!is.na(desc_sentiment_nrc))
+
+
+```
+
+### combine all reviews sentiments
+
+Since there are a lot of missing values in the loughran result, so we exclude this variable
+```{r}
+all_desc_sentiments <- desc_sentiments_bing_liu %>% 
+  inner_join(desc_sentiments_affin) %>%
+  inner_join(desc_sentiments_nrc) %>%
+  left_join(listings %>% dplyr::select(listing_id, price) %>% mutate(price = as.numeric(gsub("\\$", "", price)))) %>% na.omit()
+
+```
+
+
+```{r}
+
+ggplot(all_desc_sentiments, aes(x = log(price), y= desc_bing_liu_sentiment)) + geom_point() + geom_smooth(method = "lm")
+```
+
+## prediction models for review_rating
+predicting review ratings based on sentiment and other derived variables from reviews
+
+```{r}
+
+all_review_rating_predictors <- all_review_sentiments %>%
+  dplyr::select(-review_scores_rating) %>% 
+  inner_join(combined_vars, by = "listing_id") %>% na.omit()
+
+model_test <- lm(review_scores_rating ~. , data = all_review_rating_predictors %>% dplyr::select(-listing_id))
+
+summary(model_test)
+
+```
+
+### find significant variables using stepAIC
+```{r eval = FALSE}
+rating_model_test <- lm(review_scores_rating ~. , 
+                        data = all_review_rating_predictors %>% dplyr::select(-listing_id))
+
+rating_model_test <- MASS::stepAIC(rating_model_test, direction = "backward")
+
+saveRDS(rating_model_test, "rating_model_test.rds")
+```
+
+
+```{r}
+rating_model_test = readRDS("rating_model_test.rds")
+rating_model_test_summary = as.data.frame(summary(rating_model_test)$coefficient)
+colnames(rating_model_test_summary)[4] = "p_value"
+sig_rating_model_test_summary = rating_model_test_summary %>% filter(p_value < 0.05)
+row.names(sig_rating_model_test_summary)
+```
+Adjusted R-squared: 32.4%
+16 variables are significant: 
+"bing_liu_sentiment", "sentiment_nrc", "sentiment_loughran", "bed", "feel", "flat", "highly", "location", "nice", "night", "welcome", "avg_num_capital", "avg_num_exclamations", "avg_num_puncts", "avg_host_mentioned", and "avg_num_of_sents" 
+
+
+```{R}
+review_rating_model_test <- lm(review_scores_rating ~ bing_liu_sentiment+sentiment_nrc+sentiment_loughran+bed+feel+flat+highly+location+nice+night+welcome+avg_num_capital+avg_num_exclamations+avg_num_puncts+avg_host_mentioned+avg_num_of_sents, data = all_review_rating_predictors %>% dplyr::select(-listing_id))
+
+summary(review_rating_model_test)
+
+
+```
+adj r2 = 32%
+
+
+## predicting price based on sentiment and other derived variables from descriptions
+```{r}
+price_predictors <- all_desc_sentiments %>% inner_join(desc_predictors %>% dplyr::select(-price)) %>% left_join(listings %>% dplyr::select(listing_id, review_scores_rating)) %>% na.omit()
+
+model_test <- lm(log(price) ~. , data = price_predictors %>% dplyr::select(-listing_id))
+summary(model_test)
+
+```
+
+adjusted R2 is 48.4%
+
+### find significant variables using StepAIC
+```{r eval = FALSE}
+price_model_test <- lm(log(price) ~. , data = price_predictors %>% dplyr::select(-listing_id))
+
+price_model_test <- MASS::stepAIC(price_model_test, direction = "backward")
+
+saveRDS(price_model_test, "price_model_test.rds")
+```
+
+```{r}
+price_model_test = readRDS("price_model_test.rds")
+price_model_test_summary = as.data.frame(summary(price_model_test)$coefficient)
+colnames(price_model_test_summary)[4] = "p_value"
+sig_price_model_test_summary = price_model_test_summary %>%
+  filter(p_value < 0.05)
+row.names(sig_price_model_test_summary)
+
+```
+
+
+
+```{r}
+
+price_final_test <- lm(log(price) ~ desc_sentiment_affin+number_of_words_are_all_capital+ARI+Flesch.Kincaid+Linsear.Write+n_negative_words+word.count+formality+simpson+collision+ brillouin+tv+kitchen+`free parking on premises`+breakfast+`family/kid friendly`+shampoo+`hair dryer`+iron+ `laptop friendly workspace`+ dishwasher+ `host greets you`+ `free street parking`+`lock on bedroom door`+`extra pillows and blankets`+ `garden or backyard`+ `indoor fireplace`+`first aid kit`+ `suitable for events`+ `children’s books and toys`+ `private entrance`+ crib+ pool+ `stair gates`+ `pack ’n play/travel crib`+ `shower gel`+ `smoking allowed`+ `children’s dinnerware`+ other+ `game console`+ `paid parking on premises`+ `wide hallways`+ keypad+ `ev charger`+ `full kitchen`+ doorman+ review_scores_rating, data = price_predictors %>% dplyr::select(-listing_id))
+
+summary(price_final_test)
+```
+
+adj r2 = 48.6%
+interpretation of the model - the final variables explain 48% of the variance in the price of the dataset. 
+For example, formality has a negative 
+
+
+
+## sentiment on review level
+-----------------how to interpret lag sentiment?
+lag_sentiment and price!!
+how the sentiment of reviews changes every month for a listing, does this have affect on the price
+
+we need to calculate sentiment on review level.
+```{r}
+
+reviews_sentiments <- clean_reviews_tokens %>% inner_join(get_sentiments("bing")) %>%
+  count(sentiment,review_id) %>% spread(sentiment,n,fill = 0) %>%
+  mutate(bing_liu_sentiment = positive-negative) %>%
+  dplyr::select(review_id,bing_liu_sentiment)
+
+listing_avg_sentiment_bymonth <- lr_data_filtered %>% dplyr::select(listing_id, review_id, date, price, review_scores_rating) %>% left_join(reviews_sentiments, by = "review_id") %>% mutate(month_year = format(date, "%Y-%m")) %>% arrange(month_year) %>% group_by(listing_id, month_year) %>% summarise(avg_sentiment = mean(bing_liu_sentiment), price, review_scores_rating)
+
+
+listings_lag_sentiment <- listing_avg_sentiment_bymonth %>% na.omit() %>% group_by(listing_id) %>% arrange(month_year) %>% summarise(lag_sentiment = lag(avg_sentiment), price, review_scores_rating) %>% na.omit()
+
+
+model_test <- lm(log(price)~lag_sentiment, data = listings_lag_sentiment)
+summary(model_test)
+```
+
+
+
+
+## Visualisation
+
+```{r}
+#Creating bigrams using spaced comments 
+
+bigrams_data<-lr_data_filtered%>%unnest_tokens(bigram,spaced_comments,token = "ngrams",n=2)
+```
+
+Data cleaning needs to be performed on each word in the bigram separately. Hence we are splitting the bigrams into two separate words.
+b. Separating bigrams
+```{r}
+bigrams_separated<-bigrams_data%>%separate(bigram,c("word1","word2"),sep = " ") #Two words of the bigrams separated into columns 'word1' and 'word2'
+
+rm(bigrams_data)
+```
+
+There are words like "was","recommending" and "places" in the separated bigrams. These words need to be converted to their root forms, "be", "recommend" and "place" for analysis. This is done through lemmatization.
+c. Lemmatization
+```{r}
+bigrams_separated$lem_word1<-lemmatize_words(bigrams_separated$word1) #Lemmatizing first column words. 
+
+
+bigrams_separated$lem_word2<-lemmatize_words(bigrams_separated$word2) #Lemmatizing second column words
+```
+
+d. Remove digits from token
+```{r}
+#replacing digits with a space
+bigrams_separated$lem_word1 <- gsub('[0-9]+', ' ', bigrams_separated$lem_word1) 
+
+bigrams_separated$lem_word2<-gsub('[0-9]+', ' ', bigrams_separated$lem_word2)
+#removing spaces
+bigrams_separated <- bigrams_separated %>% filter(lem_word1 != " ")
+bigrams_separated<-bigrams_separated%>%filter(lem_word2!= " ")
+```
+
+
+e. Remove tokens with one alphabet
+```{r}
+bigrams_separated$token_length1 <- str_length(bigrams_separated$lem_word1) #Creating a separate column calculating the length of strings in the lemmatized word
+
+#observing single tokens
+bigrams_separated %>% filter(token_length1==1) %>% group_by(lem_word1) %>% summarise(total=n()) %>% arrange(desc(total))
+#Single token words were not making sense so we can remove them 
+
+#filtering tokens with one alphabet
+bigrams_separated <- bigrams_separated %>% filter(token_length1>1)
+
+#Repeating the above process for the second column of lemmatized words.
+
+bigrams_separated$token_length2 <- str_length(bigrams_separated$lem_word2)
+
+#observing single tokens
+bigrams_separated %>% filter(token_length2==1) %>% group_by(lem_word2) %>% summarise(total=n()) %>% arrange(desc(total))
+#Single token words were not making sense so we can remove them 
+
+#filtering tokens with one alphabet
+bigrams_separated <- bigrams_separated %>% filter(token_length2>1)
+```
+
+f. Observing tokens with 2 length
+```{r}
+bigrams_separated %>% filter(token_length1==2) %>% group_by(lem_word1) %>% summarise(num = n()) %>% arrange(desc(num))
+
+#Words with length of 2 characters were also not making sense and so we can remove them. 
+bigrams_separated <- bigrams_separated %>% filter(token_length1>2)
+
+#Repeating the process for second column of words
+bigrams_separated %>% filter(token_length2==2) %>% group_by(lem_word2) %>% summarise(num = n()) %>% arrange(desc(num))
+
+#removing these tokens
+
+bigrams_separated <- bigrams_separated %>% filter(token_length2>2)
+```
+
+g. Observing tokens with 3 length
+```{r}
+bigrams_separated %>% filter(token_length1==3) %>% group_by(lem_word1) %>% summarise(num = n()) %>% arrange(desc(num))
+#Most 3 character length words are sensible
+```
+
+h. Observing large tokens
+```{r}
+bigrams_separated %>% group_by(lem_word1) %>% summarise(token_length1=str_length(word1), total=n())%>% arrange(desc(token_length1, total))
+
+#Observing words with token length greater than 16
+bigrams_separated %>% filter(token_length1>16) %>% arrange(desc(token_length1))
+
+#Words of length 17 and greater do not make sense. Moreover 16 letter words, 'recommendedations', 'recommendvstaying', 'girlslunchweekend' also do not make sense. These words are later added in the custom stop words dictionary and removed.
+
+bigrams_separated <- bigrams_separated %>% filter(token_length1<17) #Removing words of length greater than 17
+```
+
+
+removing custom stopwords
+```{r}
+custom_sw <- tibble(word = c("bristol", "recommendedations", "recommendvstaying", "girlslunchweekend", "stay"), type = "custom" ) #Forming a custom stopwords dictionary of specific words 
+
+bigrams_separated <- bigrams_separated %>% anti_join(custom_sw, by=c("lem_word1"="word")) #Removing custom stop words from the first column 
+
+
+bigrams_separated <- bigrams_separated %>% anti_join(custom_sw,, by=c("lem_word2"="word")) #Removing custom stop words from the second column 
+```
+
+Forming a dataset of words preceded by "not" 
+```{r}
+afinn_dictionary <- tidytext::get_sentiments("afinn")
+
+not_words <- bigrams_separated %>%
+  filter(lem_word1 == "not") %>% #filtering rows with lemmatized word1 as 'not'
+  inner_join(afinn_dictionary, by = c(lem_word2 = "word")) %>%count(lem_word2, value, sort = TRUE) %>%ungroup() #calculating sentiment value and count of words preceded by 'not' 
+```
+
+
+Contribution of each word is calculated as the product of the sentiment score of a word and the number of times that particular word occurred. 
+```{r}
+not_words %>%
+  mutate(contribution = n * value) %>% #Calculating the contribution of each word
+  arrange(desc(abs(contribution))) %>% #Arranging words in decreasing order of their contribution
+  head(30) %>% #Selecting the top 30 words by their contribution
+  mutate(lem_word2 = reorder(lem_word2, contribution)) %>% #Reordering words column by their contribution value
+  ggplot(aes(lem_word2, n * value, fill = n * value > 0)) + #Plotting contribution vs words preceded by 'not'
+  geom_col(show.legend = FALSE) +
+  xlab("Words preceded by \"not\"") +
+  ylab("Sentiment score * Number of Occurrences") +
+  ggtitle("Polar Sentiment of Words Preceded by Not") +
+  coord_flip()
+
+```
+From the above chart we can see that words like 'recommend', 'want' and 'like' are false positives. Similarly, 'bad', 'noisy' and 'disappoint' etc are false negatives. These words are misclassified by the sentiment analysis models based on unigrams. It could potentially be  a cause of the low R^2 values of model regressing ratings on sentiment scores. From the chart we can see that highest contribution towards misclassification are of the words 'recommend' and 'hesitate'.
+
+
+There are numerous such negation words in the dataset. We have chosen four such words, 'not', 'no', 'never' and 'without'.
+```{r}
+negation_words <- c("not", "no", "never", "without") 
+negation_bigrams <- bigrams_separated %>% 
+  filter(lem_word1 %in% negation_words) %>% #selecting rows in the dataset where first lemmatized word is among the chosen negation words. 
+  inner_join(afinn_dictionary, by = c(lem_word2 = "word")) %>% #joining with the Afinn dictionary
+  count(lem_word1, lem_word2, value, sort = TRUE) %>% #counting number of instances of lemmatized word1 belonging to negation words and lemmatized word2. 
+  mutate(contribution = n * value) %>% #calculating contribution as in the previous case
+  arrange(desc(abs(contribution))) %>% #arranging words in descending order of their absolute contribution value
+  group_by(lem_word1) %>% 
+  slice(seq_len(20)) %>% #slicing dataset to get top 20 words by contribution, for each negation word
+  arrange(lem_word1,desc(contribution)) %>% 
+  ungroup()
+
+bigram_graph <- negation_bigrams %>%
+  graph_from_data_frame() #creating igraph graphs 
+
+set.seed(123)
+
+ggraph(bigram_graph, layout = "fr") + 
+  geom_edge_link(alpha = .25) +
+  geom_edge_density(aes(fill = value)) +
+  geom_node_point(color = "purple1", size = 1) + 
+  geom_node_text(aes(label = name),  repel = TRUE) +
+  theme_void() + theme(legend.position = "none",
+                       plot.title = element_text(hjust = 0.5)) +
+  ggtitle("Negation Bigram Network")
+
+negation_bigrams%>%summarise(total=sum(contribution)) #calculating sum of contributions of all words preceded by negation words
+```
+In the above chart we can see the pairs of words that are associated with negation words, 'no', 'not', 'never' and 'without'. Thus, multiple words such as 'great', 'complain', 'distraction' and 'fear' would be misclassified by sentiment analysis models based on unigrams. Multiple words such as 'disappoint', 'trouble' and 'clean' crossover to multiple nodes. Thus, the dataset contains both 'not disappoint' and 'never disappoint'; 'no trouble' and 'without trouble'; 'no clean' and 'not clean', all of which would be misclassified by the unigram based sentiment analysis model.
+From the chart we can also see that most of the words preceded by negation words would be attributed negative sentiments if analysed solely in a unigram based sentiment analysis models. The sum of contributions of all the words preceded by negation words is -1297. Thus, the sentiment analysis model based on unigram is negatively biased in this dataset.
+
+```{r}
+host_words <- bigrams_separated %>% 
+  filter(lem_word1 == "host") %>% #filtering rows with lemmatized word1 as 'host'
+  inner_join(afinn_dictionary, by = c(lem_word2 = "word")) %>%count(lem_word2, value, sort = TRUE) %>%ungroup() ##calculating sentiment value and count of words preceded by 'not'host' 
+rm(bigrams_separated)
+```
+
+
+Contribution of each word is calculated as the product of the sentiment score of a word and the number of times that particular word occurred. 
+```{r}
+host_words %>%
+  mutate(contribution = n * value) %>% #Calculating the contribution of each word
+  arrange(desc(abs(contribution))) %>% #Arranging words in decreasing order of their contribution
+  head(30)%>% #Selecting the top 30 words by their contribution
+  mutate(lem_word1 = reorder(lem_word2, contribution)) %>% #Reordering words column by their contribution value
+  ggplot(aes(lem_word1, n * value, fill = n * value > 0)) + #Plotting contribution vs words preceded by 'host'
+  geom_col(show.legend = FALSE) +
+  xlab("Words preceded by \"host\"") +
+  ylab("Sentiment score * Number of Occurrences") +
+  ggtitle("Polar Sentiment of Words Preceded by Host") +
+  coord_flip()
+```
+Above chart shows that words like 'great', 'thank' and 'lovely' are preceded by host. 'Great' has the highest positive contribution and 'cancel' has the highest negative contribution.
+
+Tokenization of spaced_comments in lr_data_filtered, using unigrams
+a. Creating tokens
+```{r}
+all_reviews_tokens <- lr_data_filtered %>%
+  unnest_tokens(output = word, input = spaced_comments)
+
+
+all_reviews_tokens %>% group_by(word) %>% summarise(word_count = n()) %>% arrange(desc(word_count)) %>% top_n(10)
+
+```
+
+c. Lemmatization
+```{r}
+library(textstem)
+all_reviews_tokens$lem_token <- textstem::lemmatize_words(all_reviews_tokens$word)
+
+lem_reviews_tokens <- all_reviews_tokens %>% select(listing_id, review_id, lem_token)
+
+lem_reviews_tokens <- lem_reviews_tokens %>% rename(word = lem_token)
+
+lem_reviews_tokens %>% group_by(word) %>% summarise(word_count = n()) %>% arrange(desc(word_count)) %>% top_n(10)
+
+rm(all_reviews_tokens)
+
+```
+
+-----------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------
+
+d. remove digits from the tokens
+
+```{r}
+
+lem_reviews_tokens$digit = str_detect(lem_reviews_tokens$word, "[0-9]+")
+
+lem_reviews_tokens = lem_reviews_tokens %>%
+  filter(digit != T)
+
+```
+
+-----------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------
+
+e. Removing stopwords
+
+using two dictionaries, tf_idf weightage and custom stopwords
+i. using stopwords dictionaries, we remove all the common stop_words
+
+```{r}
+
+#tokens reduced from 3291585 to 1267582
+
+review_tokens_common_sw_removed <- lem_reviews_tokens %>% anti_join(stop_words)
+review_tokens_common_sw_removed %>% group_by(word) %>% summarise(wordcount = n()) %>% arrange(desc(wordcount))
+```
+
+ii. Removing Fry's most common words
+
+```{r}
+
+  
+#now we remove fry200 stop words
+#tokens reduced from 3291585 to 1472349
+fry_df200 <- as.data.frame(sw_fry_200)
+colnames(fry_df200) <- "word"
+
+review_tokens_fry_200_removed <- lem_reviews_tokens %>% anti_join(fry_df200)
+
+review_tokens_fry_200_removed %>% group_by(word) %>% summarise(wordcount = n()) %>% arrange(desc(wordcount))
+
+```
+
+```{r}
+#cleaning memory
+remove(fry_df200)
+
+```
+
+iii. removing stopwords using tf-idf weights
+ziph's law
+```{r eval=FALSE}
+term_freq = lem_reviews_tokens %>%
+  count(word, sort = TRUE) %>%
+  mutate(TotalWords = sum(n),
+         rank = row_number(),
+         tf = n / TotalWords) 
+
+term_freq %>%
+  ggplot(aes(x = rank, y = tf)) + 
+  geom_line(size = 1.1, show.legend = FALSE) +
+  scale_x_log10() +
+  scale_y_log10()
+
+rm(term_freq)
+```
+
+If using listing_id as the documents, there will be too many stop words
+```{r}
+tf_idf_sw_for_reviews = lem_reviews_tokens %>%
+  count(word, review_id) %>%
+  bind_tf_idf(word, review_id, n) %>%
+  filter(tf_idf < 0.001) %>%
+  mutate(word = word, lexicon="tfidf") %>% 
+  select(word, lexicon) %>% 
+  distinct()
+
+```
+
+removing tf_idf stopwords after removing Fry's 200 most common words are removed.
+```{r}
+clean_reviews_tokens <- review_tokens_fry_200_removed %>% anti_join(tf_idf_sw_for_reviews)
+
+clean_reviews_tokens %>% group_by(word) %>% summarise(wordcount = n()) %>% arrange(desc(wordcount))
+```
+
+f. Remove tokens with one alphabet
+```{r}
+clean_reviews_tokens$token_length <- str_length(clean_reviews_tokens$word)
+#observing single tokens
+clean_reviews_tokens %>% filter(token_length==1) %>% group_by(word) %>% summarise(total=n()) %>% arrange(desc(total))
+#they don't contribute, can remove them
+#removing tokens with one alphabet
+clean_reviews_tokens <- clean_reviews_tokens %>% filter(token_length>1)
+```
+
+g. observing tokens with 2 length
+```{r}
+clean_reviews_tokens %>% filter(token_length==2) %>% group_by(word) %>% summarise(num = n()) %>% arrange(desc(num))
+#there are above 384 words with 2 token length, which seem not important. WHAT ABT TV??? are we removing wi and fi - shoud we club them?
+#removing these tokens
+
+clean_reviews_tokens <- clean_reviews_tokens %>% filter(token_length>2)
+```
+
+h. observing tokens with 3 length
+```{r eval=FALSE}
+clean_reviews_tokens %>% filter(token_length==3) %>% group_by(word) %>% summarise(num = n()) %>% arrange(desc(num))
+#we have words like bed, bus, lot, etc most which seem alright
+```
+
+i. observing large tokens
+```{r}
+clean_reviews_tokens %>% group_by(word) %>% summarise(token_length=str_length(word), total=n())%>% arrange(desc(token_length, total)) %>%unique()
+
+#manually observing the large tokens >16
+clean_reviews_tokens %>% filter(token_length>16) %>% arrange(desc(token_length))
+# we can remove all >17 and add recommendedations, recommendvstaying, girlslunchweekend to the custom list
+
+clean_reviews_tokens <- clean_reviews_tokens %>% filter(token_length<17)
+```
+
+```{r}
+listings <- read_csv("listings.csv.gz") %>% rename(listing_id = id)
+
+listings %>% 
+  select(listing_id, review_scores_rating) %>% #selecting columns 'listing_id' and 'review_scores_rating'
+  na.omit() %>%
+  unique() %>%
+  summarise(avg_rating = mean(review_scores_rating), #calculating average rating as the mean of review_scores_rating
+            std_rating = sd(review_scores_rating)) #calculating standard deviation of the review scores rating
+
+rating_categories = listings %>%
+  select(listing_id, review_scores_rating) %>%
+  mutate(rating_category = ifelse(review_scores_rating<94.46794,1,2)) #dividing review_scores_rating in two categories
+  
+
+
+ratings_categories_tokens = clean_reviews_tokens %>% 
+  left_join(rating_categories) %>%
+  group_by(rating_category, word) %>%
+  summarise(total = n())
+
+# Answers 1
+ratings_categories_tokens %>% filter(rating_category==1) %>% arrange(desc(total)) %>% top_n(10)
+ratings_categories_tokens %>% filter(rating_category==2) %>% arrange(desc(total)) %>% top_n(10)
+
+rm(rating_categories)
+```
+
+
+```{r}
+nrc_dictionary <- tidytext::get_sentiments("nrc")
+nrc_results<-clean_reviews_tokens%>%inner_join(nrc_dictionary)
+```
+
+Creating nrc results dataset which does not contain the positive and negative sentiments so that the other sentiments are more visible
+```{r}
+nrc_results_category_sub<-ratings_categories_tokens%>%inner_join(nrc_dictionary)%>%filter(!sentiment%in%c("positive","negative"))
+```
+
+
+```{r}
+#Get the count of words per sentiment per category
+nrc_results_category_sub<-nrc_results_category_sub%>% na.omit()
+category_sentiment_nrc <- nrc_results_category_sub %>% 
+  group_by(rating_category, sentiment) %>% 
+  count(rating_category, sentiment) %>% #getting count of words per rating category per sentiment
+  select(rating_category, sentiment, sentiment_rating_count = n) #creating column sentiment_rating_count to store the count of words per sentiment per rating category
+
+
+#Get the total count of sentiment words per category (not distinct)
+total_sentiment_rating <- nrc_results_category_sub %>% 
+  count(rating_category) %>%
+  select(rating_category, category_total = n) #creating category_total column to store the count of words per rating category 
+
+
+#Join the two and create a percent field
+category_sentiment_nrc %>%
+  inner_join(total_sentiment_rating, by = "rating_category") %>%
+  mutate(percent = sentiment_rating_count / category_total * 100 ) %>%
+  select(-sentiment_rating_count, -category_total) %>%
+  spread(rating_category, percent) %>%
+  chartJSRadar(showToolTipLabel = TRUE,
+               main = "NRC Years Radar")
+```
+In the above radar chart, we capture the feelings distribution of two groups. First group has review scores ratings less than 94.46794 and second group has review score ratings more than 94.46794. Greater percentage of words associated with anger, disgust, fear and sadness were used in the reviews for the first group as opposed to the second group. On the contrary, greater proportion of words in the second rating group expressed trust, anticipation and joy. This is consistent with theoretical assumption that higher score rating listings receive more positive comments. We can also see that reviews for listings which belong to the second rating category have greatest percentage of feeling of 'trust' and 'anticipation'. 
+
+
+
+
+Review sentiments for top 5 neighbourhoods
+```{r}
+
+neighbourhood_listing_id<-lr_data_filtered%>%select(listing_id,neighbourhood_cleansed)%>%unique()
+nrc_results_neighbourhood<-nrc_results%>%left_join(neighbourhood_listing_id) #creating dataset with NRC sentiment results and neighbourhood details
+
+neighbourhood_mood<-nrc_results_neighbourhood%>%filter(!sentiment%in%c("positive","negative"))%>%group_by(neighbourhood_cleansed)%>%mutate(total=n())%>%arrange(desc(total))%>%ungroup()%>%select(sentiment,neighbourhood_cleansed,total) #filtering out 'positive' and 'negative' sentiments from the data and creating column 'total' for storing the number of sentiments per neighbourhood.
+
+rm(nrc_results_neighbourhood)
+
+top_neighbourhood_mood<-neighbourhood_mood%>%select(neighbourhood_cleansed,total)%>%unique()%>%slice(1:5)%>%left_join(neighbourhood_mood)%>% select(sentiment,neighbourhood_cleansed)%>% #getting top 5 neighbourhoods
+  count(sentiment, neighbourhood_cleansed) %>% #getting count of the number of words per sentiment per neighbourhood
+  group_by(neighbourhood_cleansed, sentiment) %>%
+  summarise(sentiment_sum = sum(n))%>% #storing the count in sentiment_sum column
+  ungroup()
+
+
+circos.clear() 
+
+circos.par(gap.after = c(rep(5, length(unique(top_neighbourhood_mood[[1]])) - 1), 15,
+                         rep(5, length(unique(top_neighbourhood_mood[[2]])) - 1), 15))
+chordDiagram(top_neighbourhood_mood, transparency = .2)
+title("Relationship Between Mood and Neighbourhood") 
+```
+From the above chart we can see that reviewers found most accommodations in the Ashley neighborhood as trustworthy. 
+
+
+
+
+
+
+Clear memory
+```{r}
+rm(all_desc_sentiments, all_review_sentiments, desc_sentiments_affin, desc_sentiments_bing_liu, desc_sentiments_loughran, desc_sentiments_nrc, listing_avg_sentiment_bymonth, listings_lag_sentiment, model_test, price_model_test, price_model_test_summary, price_final_test, rating_model_test, rating_model_test_summary, review_rating_model_test, reviews_sentiments, sig_price_model_test_summary, sig_rating_model_test_summary, desc_predictors, combined_vars)
+```
+
+
+
+
+
+
+
+-----------------------------------------------------------------------------------
+######==================================End PartB==================================######
+-----------------------------------------------------------------------------------
+
+
+# Part C
+## Reviews
+### Data Preprocessing
+#### udpipe process
+```{r}
+ud_model = udpipe_load_model(udpipe::udpipe_download_model("english"))
+```
+
+#### Tokenisation, Lemmatization, Part of Speech tagging
+```{r eval = FALSE}
+
+annotated_reviews_all = udpipe_annotate(object = ud_model,
+                             lr_data_filtered$no_contraction_comments,
+                             doc_id = lr_data_filtered$review_id,
+                             parallel.cores = 8, 
+                             trace = F)
+
+annotated_reviews_all = as.data.frame(annotated_reviews_all)
+
+saveRDS(annotated_reviews_all, "annotated_reviews_all.rds")
+```
+
+```{r}
+annotated_reviews_all = readRDS("annotated_reviews_all.rds")
+
+annotated_reviews_all %>% dplyr::select(upos) %>% unique()
+
+
+annotated_reviews_all = annotated_reviews_all %>%
+  mutate(lower_lemma = tolower(lemma))
+
+# Only retain words in Noun, Adj and Adv for topic modeling
+annotated_reviews_N_ADJ_ADV = annotated_reviews_all %>%
+  filter(upos %in% c("NOUN", "ADJ", "ADV")) %>%
+  mutate(nchar = nchar(lower_lemma)) 
+
+# # Check the token length
+# annotated_reviews_N_ADJ_ADV$lemma[which(annotated_reviews_N_ADJ_ADV$nchar <= 2)] %>% unique()
+# 
+# annotated_reviews_N_ADJ_ADV$lemma[which(annotated_reviews_N_ADJ_ADV$nchar > 15)]%>% unique()
+# 
+# View( annotated_reviews_N_ADJ_ADV %>% select(lower_lemma, nchar) %>% unique() %>% arrange(desc(nchar)) )
+
+# remove short tokens
+annotated_reviews_N_ADJ_ADV = annotated_reviews_N_ADJ_ADV %>%
+  filter(nchar < 17) %>%
+  filter(nchar > 2 | lower_lemma == "tv")
+```
+TV can be informative here so I keep it
+
+#### Detokenisation
+there are 47 missing values in price and review_scores_rating
+```{r}
+udpipe_detokenised_reviews = annotated_reviews_N_ADJ_ADV %>%
+  group_by(doc_id) %>%
+  dplyr::summarise(annotated_comments = paste(lower_lemma, collapse = " ")) %>%
+  dplyr::rename(review_id = doc_id) %>%
+  mutate(review_id = as.numeric(review_id)) %>%
+  left_join(lr_data_filtered %>% dplyr::select(listing_id, review_id, price, review_scores_rating) %>% unique()) %>%
+  mutate(price = as.numeric(gsub("\\$", "", price))) %>%
+  na.omit()
+
+# remove short reviews
+udpipe_detokenised_reviews = udpipe_detokenised_reviews %>%
+  mutate(n_words = str_count(annotated_comments, "\\b[A-Za-z]+\\b")) %>%
+  filter(n_words >= 5)
+
+# remove listings which have less than 5 comments
+udpipe_detokenised_reviews = udpipe_detokenised_reviews %>%
+  group_by(listing_id) %>%
+  dplyr::mutate(n_reviews = n()) %>%
+  ungroup() %>%
+  filter(n_reviews > 5)
+
+udpipe_detokenised_reviews = udpipe_detokenised_reviews %>%
+  dplyr::select(-n_reviews, -n_words)
+
+
+rm(annotated_reviews_N_ADJ_ADV)
+```
+
+#### Construct stop words corpus
+```{r}
+# My own stop words
+my_stopwords = data.frame(
+  word = c("airbnb", "bristol", "stay", "clifton"),
+  lexicon = "custom"
+)
+```
+
+```{r eval = FALSE}
+# stop words from Tf-Idf
+tfidf_reviews = annotated_reviews_all %>%
+  dplyr::filter(!upos %in% c("PUNCT", "NUM", "SYM")) %>%
+  dplyr::count(doc_id, lower_lemma) %>%
+  bind_tf_idf(lower_lemma, doc_id, n) %>%
+  dplyr::arrange(desc(tf_idf))
+
+saveRDS(tfidf_reviews, "tfidf_reviews.rds")
+```
+
+```{r}
+tfidf_reviews = readRDS("tfidf_reviews.rds")
+
+tfidf_reviews_stopwords = tfidf_reviews%>%
+  dplyr::filter(tf_idf < 0.0015) %>%
+  dplyr::select(lower_lemma) %>%
+  dplyr::rename(word = lower_lemma) %>%
+  mutate(lexicon = "TFIDF") %>%
+  unique()
+
+# combine dictionaries
+my_stopwords = my_stopwords %>%
+  rbind(tfidf_reviews_stopwords)
+
+all_stopwords = stop_words %>%
+  rbind(my_stopwords)
+
+rm(tfidf_reviews_stopwords)
+```
+
+
+
+### STM modelling
+#### Text Processing
+```{r eval = FALSE}
+reviews_processed = textProcessor(udpipe_detokenised_reviews$annotated_comments,
+                          metadata = udpipe_detokenised_reviews,
+                          customstopwords = my_stopwords$word,
+                          stem = F)
+
+saveRDS(reviews_processed, "reviews_processed.rds")
+```
+
+
+
+#### Preprocessing output
+```{r}
+reviews_processed = readRDS("reviews_processed.rds")
+
+# Threshold: Keep only those words that appear on the 1% of the corpus
+threshold = round(1/100 * length(reviews_processed$documents),0)
+
+reviews_out = prepDocuments(reviews_processed$documents,
+                    reviews_processed$vocab,
+                    reviews_processed$meta,
+                    lower.thresh = threshold)
+
+rm(threshold)
+```
+Remove 14 documents with no word that appear on the 1% of the corpus
+```{r}
+reviews_out$docs.removed
+
+udpipe_detokenised_reviews$annotated_comments[reviews_out$docs.removed]
+```
+
+Remove those reviews in our corpus
+```{r}
+reviews_corpus = udpipe_detokenised_reviews[-reviews_out$docs.removed,]
+```
+
+
+#### Find the optimal number of K
+```{r eval = FALSE}
+numtopics_reviews = searchK(reviews_out$documents,reviews_out$vocab,K=seq(from=4, to=10,by=1))
+
+saveRDS(numtopics_reviews, "optimal_topic_number(reviews).rds")
+```
+
+```{r}
+numtopics_reviews = readRDS("optimal_topic_number(reviews).rds")
+
+plot(numtopics_reviews)
+```
+It shows that the optimal value of K is 6
+
+
+#### Optimal solution (k = 6)
+```{r eval = FALSE}
+stm_reviews_6topic = stm(documents = reviews_out$documents,
+                   vocab = reviews_out$vocab,
+                   K = 6,
+                   prevalence =~ price+review_scores_rating,
+                   max.em.its = 75, 
+                   data = reviews_out$meta,
+                   reportevery=3,
+                   # gamma.prior = "L1",
+                   sigma.prior = 0.7,
+                   init.type = "Spectral")
+
+saveRDS(stm_reviews_6topic, "stm_reviews_6topic.rds")
+```
+
+```{r}
+stm_reviews_6topic = readRDS("stm_reviews_6topic.rds")
+
+summary(stm_reviews_6topic)
+```
+
+```{r}
+stm_reviews_6topic_summary = summary(stm_reviews_6topic)
+stm_reviews_6topic_proportions = colMeans(stm_reviews_6topic$theta)
+topic_labels = paste0("topic_",1:6)
+stm_reviews_6topic_labels = data.frame()
+for(i in 1:length(stm_reviews_6topic_summary$topicnums)){
+   row_here = data.frame(topicnum = stm_reviews_6topic_summary$topicnums[i],
+                     topic_label = topic_labels[i],
+                     proportion = 100*round(stm_reviews_6topic_proportions[i],4),
+                     frex_words = paste(stm_reviews_6topic_summary$frex[i,1:7],
+                                        collapse = ", "))
+   stm_reviews_6topic_labels = rbind(row_here, stm_reviews_6topic_labels)
+}
+rm(row_here, topic_labels, stm_reviews_6topic_proportions, i)
+
+( stm_reviews_6topic_labels = stm_reviews_6topic_labels %>% arrange(topicnum) )
+```
+
+##### Word cloud for 6-topic solution in reviews
+```{r}
+cloud(stm_reviews_6topic,topic = 1)
+cloud(stm_reviews_6topic,topic = 2)
+cloud(stm_reviews_6topic,topic = 3)
+cloud(stm_reviews_6topic,topic = 4)
+cloud(stm_reviews_6topic,topic = 5)
+cloud(stm_reviews_6topic,topic = 6)
+```
+Topic1: hosts
+Topic2: Services
+Topic3: Facility
+Topic4: Property
+Topic5: return in the future
+Topic6: Neighbourhood
+
+##### Theta matrix: the proportion for each topic in a document (document-topic)
+```{r}
+stm_reviews_6topic_theta = as.data.frame(stm_reviews_6topic$theta)
+colnames(stm_reviews_6topic_theta) = paste0("topic_",1:6)
+```
+##### Beta matrix: the probabilities for a term belongs to a topic (topic-term)
+```{r}
+stm_reviews_6topic_beta = as.data.frame(stm_reviews_6topic$beta)
+colnames(stm_reviews_6topic_beta) = stm_reviews_6topic$vocab
+stm_reviews_6topic_beta$topic = paste0("topic_",1:6)
+stm_reviews_6topic_beta = stm_reviews_6topic_beta %>%
+  pivot_longer(-topic, names_to = "term", values_to = "probability")
+
+stm_reviews_6topic_beta %>%
+  group_by(topic) %>%
+  top_n(10, probability) %>%
+  ungroup() %>%
+  mutate(term = fct_reorder(term, probability, .desc = TRUE)) %>%
+  ggplot(aes(x = term, y = probability, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~topic, scales = "free_y") +
+  coord_flip()
+
+```
+
+##### Regression
+```{r}
+reviews_corpus_6 = reviews_corpus %>%
+  cbind(stm_reviews_6topic_theta)
+```
+
+Average proportion of topics
+```{r}
+reviews_average_6 = reviews_corpus_6 %>%
+  group_by(listing_id, price, review_scores_rating) %>%
+  dplyr::summarise(topic_1 = mean(topic_1),
+            topic_2 = mean(topic_2),
+            topic_3 = mean(topic_3),
+            topic_4 = mean(topic_4),
+            topic_5 = mean(topic_5),
+            topic_6 = mean(topic_6)) %>%
+  ungroup() %>%
+  na.omit()
+
+
+# Check correlation
+cor(reviews_average_6%>%dplyr::select(-c(listing_id,price,review_scores_rating)))
+corrplot::corrplot(cor(reviews_average_6%>%dplyr::select(-c(listing_id,price,review_scores_rating))))
+summary(lm(topic_6~topic_1+topic_2+topic_3+topic_4+topic_5, reviews_average_6))
+```
+##### rating vs 6 topics
+```{r}
+m_rating_avg_6 = lm((review_scores_rating)~topic_1+topic_2+topic_3+topic_4+topic_5+topic_6, data = reviews_average_6)
+summary(m_rating_avg_6)
+
+anova(m_rating_avg_6)
+
+```
+##### Label listings with topics
+```{r}
+reviews_average_6$labelled = colnames(reviews_average_6[,4:9])[max.col(reviews_average_6[,4:9],ties.method="first")]
+
+ggplot(reviews_average_6, aes(x = labelled, y = review_scores_rating)) + geom_jitter()
+```
+
+
+------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------
+
+
+### LDA modelling
+#### Data preparation and DTM construction
+```{r eval = FALSE}
+no_stopword_reviews = udpipe_detokenised_reviews %>%
+  unnest_tokens(input = annotated_comments, output = word) %>%
+  anti_join(all_stopwords)
+saveRDS(no_stopword_reviews, "no_stopword_reviews.rds")
+```
+
+```{r}
+no_stopword_reviews = readRDS("no_stopword_reviews.rds")
+reviews_dtm = no_stopword_reviews %>%
+  dplyr::count(review_id, word) %>%
+  cast_dtm(document=review_id, term=word, value=n)
+```
+#### Find the optimal number of topics
+```{r eval = FALSE}
+reviews_perplexity = numeric(10)
+reviews_loglikelihood = numeric(10)
+for (i in 4:10){
+  print(i)
+  mod = LDA(x = reviews_dtm, method="Gibbs", k=i, 
+          control=list(seed=1234))
+  reviews_perplexity[i] = perplexity(object=mod, newdata = reviews_dtm)
+  reviews_loglikelihood[i] = logLik(mod)
+}
+rm(i, mod)
+
+saveRDS(reviews_perplexity, "reviews_perplexity.rds")
+saveRDS(reviews_loglikelihood, "reviews_loglikelihood.rds")
+```
+
+```{r}
+reviews_perplexity = readRDS("reviews_perplexity.rds")
+reviews_loglikelihood = readRDS("reviews_loglikelihood.rds")
+```
+Perplexity
+```{r}
+plot(x = 4:10, y = reviews_perplexity[4:10], xlab="number of topics, k", 
+     ylab="perplexity score", type="o")
+```
+The elbow point in the perplexity plot is not obvious.
+
+Log-likelihood
+```{r}
+plot(x = 4:10, y = reviews_loglikelihood[4:10], xlab="number of topics, k", 
+     ylab="Log-likelihood", type="o")
+```
+The elbow point in the log-likelihood plot is not obvious.
+
+
+
+#### LDA 6-topic modelling
+```{r eval = FALSE}
+reviews_lda_mod_6 = LDA(x = reviews_dtm, method="Gibbs", k=6, 
+          control=list(seed=1234))
+
+saveRDS(reviews_lda_mod_6, "reviews_lda_mod_6.rds")
+```
+
+```{r}
+reviews_lda_mod_6 = readRDS("reviews_lda_mod_6.rds")
+```
+
+##### Beta matrix (topic-term) and topic interpretation
+```{r}
+lda_reviews_6topic_term = reviews_lda_mod_6 %>%
+  tidy(matrix = "beta") %>%
+  arrange(desc(beta))
+  
+lda_reviews_6topic_term = lda_reviews_6topic_term %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  mutate(term = fct_reorder(term, beta))
+
+lda_reviews_6topic_term %>%
+  ggplot(aes(x = term, y = beta, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~topic, scales = "free_y") +
+  coord_flip()
+```
+Topic1: Hosts
+Topic2: Location (centre, city, restaurant)
+Topic3: 
+Topic4: Overall comments on property
+Topic5: Facility (bathroom, kitchen, bedroom, shower)
+Topic6: Transportation
+
+Some topics are not interpretable.
+
+
+##### Theta matrix (document-topic)
+```{r}
+lda_reviews_document_6topic = reviews_lda_mod_6 %>%
+  tidy(matrix = "gamma") %>%
+  pivot_wider(names_from = topic, values_from = gamma)
+
+colnames(lda_reviews_document_6topic) = c("review_id", paste0("topic_", 1:6))
+
+review_lda_results_6 = udpipe_detokenised_reviews %>%
+  left_join(lda_reviews_document_6topic %>% mutate(review_id = as.numeric(review_id)))
+```
+
+```{r}
+reviews_average_lda_6 = review_lda_results_6 %>%
+  group_by(listing_id, price, review_scores_rating) %>%
+  dplyr::summarise(topic_1 = mean(topic_1),
+            topic_2 = mean(topic_2),
+            topic_3 = mean(topic_3),
+            topic_4 = mean(topic_4),
+            topic_5 = mean(topic_5),
+            topic_6 = mean(topic_6)) %>%
+  ungroup() %>%
+  na.omit()
+
+
+# Check correlation
+cor(reviews_average_lda_6%>%select(-c(listing_id,price,review_scores_rating)))
+corrplot::corrplot(cor(reviews_average_lda_6%>%select(-c(listing_id,price,review_scores_rating))))
+summary(lm(topic_6~topic_1+topic_2+topic_3+topic_4+topic_5, reviews_average_lda_6))
+```
+
+
+##### rating vs 6 topics
+```{r}
+m_lda_rating_avg_6 = lm(review_scores_rating~topic_1+topic_2+topic_3+topic_4+topic_5+topic_6, data = reviews_average_lda_6)
+summary(m_lda_rating_avg_6)
+anova(m_lda_rating_avg_6)
+```
+
+##### Label listings with topics
+```{r}
+reviews_average_lda_6$labelled = colnames(reviews_average_lda_6[,4:9])[max.col(reviews_average_lda_6[,4:9],ties.method="first")]
+```
+
+
+
+
+### Final model: reviews
+LDA with 6 topics: 0.499
+***STM with 6 topics: 0.8429*** is the best model for reviews to predict review rating scores
+
+```{r}
+stm_reviews_6topic
+View(reviews_average_6)
+```
+
+
+
+
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+######===========================Reviews Ended===========================######
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+
+
+
+
+
+
+## Descriptions
+### Data Preprocessing
+```{r}
+desc_data = all_descriptions_filtered  %>% 
+  dplyr::select(listing_id, no_contraction_desc, price, review_scores_rating) %>% unique() %>%
+  mutate(price = as.numeric(gsub("\\$", "", price))) %>%
+  na.omit()
+```
+
+#### udpipe process
+```{r eval = FALSE}
+ud_model = udpipe_load_model(udpipe::udpipe_download_model("english"))
+
+annotated_desc_all = udpipe_annotate(object = ud_model,
+                             desc_data$no_contraction_desc,
+                             doc_id = desc_data$listing_id,
+                             parallel.cores = 8, 
+                             trace = F)
+
+annotated_desc_all = as.data.frame(annotated_desc_all)
+saveRDS(annotated_desc_all, "annotated_desc_all.rds")
+```
+
+
+#### Tokenisation, Lemmatization, Part of Speech tagging
+```{r}
+annotated_desc_all = readRDS("annotated_desc_all.rds")
+
+annotated_desc_all = annotated_desc_all %>%
+  mutate(lower_lemma = tolower(lemma))
+
+
+# Only retain words in Noun, Adj and Adv for topic modeling
+annotated_desc_N_ADJ_ADV = annotated_desc_all %>%
+  filter(upos %in% c("NOUN", "ADJ", "ADV")) %>%
+  mutate(nchar = nchar(lower_lemma)) 
+
+# Check the token length
+# annotated_desc_N_ADJ_ADV$lemma[which(annotated_desc_N_ADJ_ADV$nchar <= 2)]
+# 
+# annotated_desc_N_ADJ_ADV$lemma[which(annotated_desc_N_ADJ_ADV$nchar > 15)]
+# 
+# View( annotated_desc_N_ADJ_ADV %>% select(lower_lemma, nchar) %>% unique() %>% arrange(desc(nchar)) )
+
+# remove short tokens
+annotated_desc_N_ADJ_ADV = annotated_desc_N_ADJ_ADV %>%
+  filter(nchar < 17) %>%
+  filter(nchar > 2 | lower_lemma == "tv")
+```
+
+
+#### Detokenisation
+there are some missing values in price and review_scores_rating
+```{r}
+udpipe_detokenised_desc = annotated_desc_N_ADJ_ADV %>%
+  group_by(doc_id) %>%
+  dplyr::summarise(annotated_desc = paste(lower_lemma, collapse = " ")) %>%
+  dplyr::rename(listing_id = doc_id) %>%
+  mutate(listing_id = as.numeric(listing_id)) %>%
+  left_join(all_descriptions_filtered %>% dplyr::select(listing_id, price, review_scores_rating) %>% unique()) %>%
+  mutate(price = as.numeric(gsub("\\$", "", price))) %>%
+  na.omit()
+
+# remove short description
+udpipe_detokenised_desc = udpipe_detokenised_desc %>%
+  mutate(n_words = str_count(annotated_desc, "\\b[A-Za-z]+\\b")) %>%
+  filter(n_words >= 5)
+
+udpipe_detokenised_desc = udpipe_detokenised_desc %>%
+  dplyr::select(-n_words)
+
+rm(annotated_desc_N_ADJ_ADV)
+```
+1705 observations
+
+#### Construct stop words corpus
+```{r}
+# My own stop words
+my_stopwords = data.frame(
+  word = c("airbnb", "bristol", "stay", "clifton"),
+  lexicon = "custom"
+)
+```
+
+```{r eval = FALSE}
+# stop words from Tf-Idf
+tfidf_descriptions = annotated_desc_all %>%
+  dplyr::filter(!upos %in% c("PUNCT", "NUM", "SYM")) %>%
+  dplyr::count(doc_id, lower_lemma) %>%
+  bind_tf_idf(lower_lemma, doc_id, n) %>%
+  dplyr::arrange(desc(tf_idf))
+saveRDS(tfidf_descriptions, "tfidf_descriptions.rds")
+```
+
+```{r}
+tfidf_descriptions = readRDS("tfidf_descriptions.rds")
+
+tfidf_descriptions_stopwords = tfidf_descriptions %>%
+  filter(tf_idf < 0.0003) %>%
+  dplyr::select(lower_lemma) %>%
+  dplyr::rename(word = lower_lemma) %>%
+  mutate(lexicon = "TFIDF") %>%
+  unique()
+
+# combine dictionaries
+my_stopwords = my_stopwords %>%
+  rbind(tfidf_descriptions_stopwords)
+
+all_stopwords = stop_words %>%
+  rbind(my_stopwords)
+
+rm(tfidf_descriptions_stopwords)
+```
+
+
+### STM modelling
+#### Text Processing
+```{r eval = FALSE}
+desc_processed = textProcessor(udpipe_detokenised_desc$annotated_desc,
+                          metadata = udpipe_detokenised_desc,
+                          customstopwords = my_stopwords$word,
+                          stem = F)
+
+saveRDS(desc_processed, "desc_processed.rds")
+```
+
+
+#### Preprocessing output
+```{r}
+desc_processed = readRDS("desc_processed.rds")
+
+# Threshold: Keep only those words that appear on the 1% of the corpus
+threshold = round(1/100 * length(desc_processed$documents),0)
+
+desc_out = prepDocuments(desc_processed$documents,
+                    desc_processed$vocab,
+                    desc_processed$meta,
+                    lower.thresh = threshold)
+
+rm(threshold)
+
+desc_out$docs.removed
+```
+No document is removed
+
+#### Find the optimal number of K
+```{r eval = FALSE}
+numtopics_desc = searchK(desc_out$documents,desc_out$vocab,K=seq(from=4, to=10, by=1))
+
+saveRDS(numtopics_desc, "optimal_topic_number(description).rds")
+```
+
+```{r}
+numtopics_desc = readRDS("optimal_topic_number(description).rds")
+
+plot(numtopics_desc)
+```
+It shows that the optimal value of K is 8
+
+
+#### Optimal solution (k = 8)
+```{r eval = FALSE}
+stm_desc_8topic = stm(documents = desc_out$documents,
+                   vocab = desc_out$vocab,
+                   K = 8,
+                   prevalence =~ price+review_scores_rating,
+                   max.em.its = 75, 
+                   data = desc_out$meta,
+                   reportevery=3,
+                   # gamma.prior = "L1",
+                   sigma.prior = 0.7,
+                   init.type = "Spectral")
+
+saveRDS(stm_desc_8topic, "stm_desc_8topic.rds")
+```
+
+```{r}
+stm_desc_8topic = readRDS("stm_desc_8topic.rds")
+
+summary(stm_desc_8topic)
+```
+
+
+```{r}
+stm_desc_8topic_summary = summary(stm_desc_8topic)
+stm_desc_8topic_proportions = colMeans(stm_desc_8topic$theta)
+
+topic_labels = paste0("topic_",1:8)
+stm_desc_8topic_labels = data.frame()
+for(i in 1:length(stm_desc_8topic_summary$topicnums)){
+   row_here = data.frame(topicnum = stm_desc_8topic_summary$topicnums[i],
+                     topic_label = topic_labels[i],
+                     proportion = 100*round(stm_desc_8topic_proportions[i],4),
+                     frex_words = paste(stm_desc_8topic_summary$frex[i,1:7],
+                                        collapse = ", "))
+   stm_desc_8topic_labels = rbind(row_here, stm_desc_8topic_labels)
+}
+
+rm(row_here, topic_labels, stm_desc_8topic_proportions, i)
+
+stm_desc_8topic_labels = stm_desc_8topic_labels %>% arrange(topicnum)
+```
+
+
+##### Word cloud for 8-topic solution in descriptions
+```{r}
+cloud(stm_desc_8topic,topic = 1, max.words = 40)
+cloud(stm_desc_8topic,topic = 2, max.words = 40)
+cloud(stm_desc_8topic,topic = 3, max.words = 40)
+cloud(stm_desc_8topic,topic = 4, max.words = 40)
+cloud(stm_desc_8topic,topic = 5, max.words = 40)
+cloud(stm_desc_8topic,topic = 6, max.words = 40)
+cloud(stm_desc_8topic,topic = 7, max.words = 40)
+cloud(stm_desc_8topic,topic = 8, max.words = 40)
+```
+
+Topic 1: House (garden, access, home)
+Topic 2: Facility (bedroom, microwave, towel, machine, freezer, available)
+Topic 3:
+Topic 4: Car (park, entrance, private, available)
+Topic 5: Neighbourhood (min, station, train, bar, away)
+Topic 6: 
+
+
+##### Theta matrix: the proportion for each topic in a document (document-topic)
+```{r}
+stm_desc_8topic_theta = as.data.frame(stm_desc_8topic$theta)
+colnames(stm_desc_8topic_theta) = paste0("topic_",1:8)
+```
+
+
+##### Beta matrix: the probabilities for a term belongs to a topic (topic-term)
+```{r}
+stm_desc_8topic_beta = as.data.frame(stm_desc_8topic$beta)
+colnames(stm_desc_8topic_beta) = stm_desc_8topic$vocab
+stm_desc_8topic_beta$topic = paste0("topic_",1:8)
+stm_desc_8topic_beta = stm_desc_8topic_beta %>%
+  pivot_longer(-topic, names_to = "term", values_to = "probability")
+
+stm_desc_8topic_beta %>%
+  group_by(topic) %>%
+  top_n(10, probability) %>%
+  ungroup() %>%
+  mutate(term = fct_reorder(term, probability, .desc = TRUE)) %>%
+  ggplot(aes(x = term, y = probability, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~topic, scales = "free_y") +
+  coord_flip()
+```
+
+
+
+##### Regression
+```{r}
+desc_corpus_8 = udpipe_detokenised_desc %>%
+  cbind(stm_desc_8topic_theta)
+```
+
+```{r}
+
+# Check correlation
+cor(desc_corpus_8%>%select(-c(listing_id,price,review_scores_rating,annotated_desc)))
+corrplot::corrplot(cor(desc_corpus_8%>%select(-c(listing_id,price,review_scores_rating,annotated_desc))))
+
+summary(lm(topic_8~topic_1+topic_2+topic_3+topic_4+topic_5+topic_6+topic_7, desc_corpus_8))
+```
+
+##### price vs 8 topics
+```{r}
+# price
+m_desc_price_8 = lm(log(price)~topic_1+topic_2+topic_3+topic_4+topic_5+topic_6+topic_7+topic_8, data = desc_corpus_8)
+summary(m_desc_price_8)
+
+anova(m_desc_price_8)
+```
+
+##### Label listings with topics
+```{r}
+View(desc_corpus_8)
+
+desc_corpus_8$labelled = colnames(desc_corpus_8[,5:12])[max.col(desc_corpus_8[,5:12],ties.method="first")]
+```
+
+
+
+#### Try 9-topic solution
+```{r eval = FALSE}
+stm_desc_9topic = stm(documents = desc_out$documents,
+                   vocab = desc_out$vocab,
+                   K = 9,
+                   prevalence =~ price+review_scores_rating,
+                   max.em.its = 75, 
+                   data = desc_out$meta,
+                   reportevery=3,
+                   # gamma.prior = "L1",
+                   sigma.prior = 0.7,
+                   init.type = "Spectral")
+
+saveRDS(stm_desc_9topic, "stm_desc_9topic.rds")
+```
+
+
+```{r}
+stm_desc_9topic = readRDS("stm_desc_9topic.rds")
+
+summary(stm_desc_9topic)
+```
+
+
+
+```{r}
+stm_desc_9topic_summary = summary(stm_desc_9topic)
+stm_desc_9topic_proportions = colMeans(stm_desc_9topic$theta)
+
+topic_labels = paste0("topic_",1:9)
+stm_desc_9topic_labels = data.frame()
+for(i in 1:length(stm_desc_9topic_summary$topicnums)){
+   row_here = data.frame(topicnum = stm_desc_9topic_summary$topicnums[i],
+                     topic_label = topic_labels[i],
+                     proportion = 100*round(stm_desc_9topic_proportions[i],4),
+                     frex_words = paste(stm_desc_9topic_summary$frex[i,1:7],
+                                        collapse = ", "))
+   stm_desc_9topic_labels = rbind(row_here, stm_desc_9topic_labels)
+}
+
+rm(row_here, topic_labels, stm_desc_9topic_proportions, i)
+
+stm_desc_9topic_labels = stm_desc_9topic_labels %>% arrange(topicnum)
+```
+
+
+##### Word cloud for 9-topic solution in descriptions
+```{r}
+cloud(stm_desc_9topic,topic = 1, max.words = 40)
+cloud(stm_desc_9topic,topic = 2, max.words = 40)
+cloud(stm_desc_9topic,topic = 3, max.words = 40)
+cloud(stm_desc_9topic,topic = 4, max.words = 40)
+cloud(stm_desc_9topic,topic = 5, max.words = 40)
+cloud(stm_desc_9topic,topic = 6, max.words = 40)
+cloud(stm_desc_9topic,topic = 7, max.words = 40)
+cloud(stm_desc_9topic,topic = 8, max.words = 40)
+cloud(stm_desc_9topic,topic = 9, max.words = 40)
+```
+
+Topic 1: available facility (bedroom, space, bathroom, machine, available)
+Topic 2: Facility (bedroom, microwave, towel, machine, freezer, available)
+Topic 3:
+Topic 4: Car (park, entrance, private, available)
+Topic 5: Neighbourhood (min, station, train, bar, away)
+Topic 6: 
+Topic 7:
+Topic 8:
+Topic 9:
+
+
+##### Theta matrix: the proportion for each topic in a document (document-topic)
+```{r}
+stm_desc_9topic_theta = as.data.frame(stm_desc_9topic$theta)
+colnames(stm_desc_9topic_theta) = paste0("topic_",1:9)
+```
+
+
+##### Beta matrix: the probabilities for a term belongs to a topic (topic-term)
+```{r}
+stm_desc_9topic_beta = as.data.frame(stm_desc_9topic$beta)
+colnames(stm_desc_9topic_beta) = stm_desc_9topic$vocab
+stm_desc_9topic_beta$topic = paste0("topic_",1:9)
+stm_desc_9topic_beta = stm_desc_9topic_beta %>%
+  pivot_longer(-topic, names_to = "term", values_to = "probability")
+
+stm_desc_9topic_beta %>%
+  group_by(topic) %>%
+  top_n(10, probability) %>%
+  ungroup() %>%
+  mutate(term = fct_reorder(term, probability, .desc = TRUE)) %>%
+  ggplot(aes(x = term, y = probability, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~topic, scales = "free_y") +
+  coord_flip()
+```
+
+
+##### Regression
+```{r}
+desc_corpus_9 = udpipe_detokenised_desc
+
+desc_corpus_9 = desc_corpus_9 %>%
+  cbind(stm_desc_9topic_theta)
+```
+
+```{r}
+
+# Check correlation
+cor(desc_corpus_9%>%select(-c(listing_id,price,review_scores_rating,annotated_desc)))
+corrplot::corrplot(cor(desc_corpus_9%>%select(-c(listing_id,price,review_scores_rating,annotated_desc))))
+
+summary(lm(topic_9~topic_1+topic_2+topic_3+topic_4+topic_5+topic_6+topic_7+topic_8, desc_corpus_9))
+```
+
+##### price vs 9 topics
+```{r}
+# price
+m_desc_price_9 = lm(log(price)~topic_1+topic_2+topic_3+topic_4+topic_5+topic_6+topic_7+topic_8+topic_9, data = desc_corpus_9)
+summary(m_desc_price_9)
+
+anova(m_desc_price_9)
+```
+
+##### Label listings with topics
+```{r}
+View(desc_corpus_9)
+
+desc_corpus_9$labelled = colnames(desc_corpus_9[,5:13])[max.col(desc_corpus_9[,5:13],ties.method="first")]
+```
+
+
+
+-------------------------------------------------------
+
+### LDA modelling
+#### Data preparation and DTM construction
+```{r eval = FALSE}
+no_stopword_desc = udpipe_detokenised_desc %>%
+  unnest_tokens(input = annotated_desc, output = word) %>%
+  anti_join(all_stopwords)
+
+saveRDS(no_stopword_desc, "no_stopword_desc.rds")
+```
+
+```{r}
+no_stopword_desc = readRDS("no_stopword_desc.rds")
+
+desc_dtm = no_stopword_desc %>%
+  dplyr::count(listing_id, word) %>%
+  cast_dtm(document=listing_id, term=word, value=n)
+```
+
+#### Find the optimal number of topics
+```{r eval = FALSE}
+desc_perplexity = numeric(10)
+desc_loglikelihood = numeric(10)
+
+for (i in 4:10){
+  print(i)
+  mod = LDA(x = desc_dtm, method="Gibbs", k=i, 
+          control=list(seed=1234))
+  desc_perplexity[i] = perplexity(object=mod, newdata = desc_dtm)
+  desc_loglikelihood[i] = logLik(mod)
+}
+rm(i, mod)
+
+saveRDS(desc_perplexity, "desc_perplexity.rds")
+saveRDS(desc_loglikelihood, "desc_loglikelihood.rds")
+```
+
+```{r}
+desc_perplexity = readRDS("desc_perplexity.rds")
+desc_loglikelihood = readRDS("desc_loglikelihood.rds")
+```
+
+Perplexity
+```{r}
+plot(x = 4:10, y = desc_perplexity[4:10], xlab="number of topics, k", 
+     ylab="perplexity score", type="o")
+```
+The elbow point in the perplexity plot is not obvious.
+
+Log-likelihood
+```{r}
+plot(x = 4:10, y = desc_loglikelihood[4:10], xlab="number of topics, k", 
+     ylab="Log-likelihood", type="o")
+```
+The elbow point in the log-likelihood plot is 6.
+
+#### LDA 6-topic modelling
+```{r eval = FALSE}
+desc_lda_mod6 = LDA(x = desc_dtm, method="Gibbs", k=6, 
+          control=list(seed=1234))
+
+saveRDS(desc_lda_mod6, "desc_lda_mod6.rds")
+```
+
+```{r}
+desc_lda_mod6 = readRDS("desc_lda_mod6.rds")
+```
+
+##### Beta matrix (topic-term)
+```{r}
+lda_desc_6topic_term = desc_lda_mod6 %>%
+  tidy(matrix = "beta") %>%
+  arrange(desc(beta))
+  
+lda_desc_6topic_term = lda_desc_6topic_term %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  mutate(term2 = fct_reorder(term, beta))
+
+lda_desc_6topic_term %>%
+  ggplot(aes(x = term2, y = beta, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~topic, scales = "free_y") +
+  coord_flip()
+```
+Topic1: House
+Topic2: host
+Topic3: 
+Topic4: Location (centre, city, close, restaurant, walk)
+Topic5: Facility (bathroom, kitchen, bedroom, shower)
+Topic6: Breakfast
+Topic7: Response
+
+Some topics are not interpretable.
+
+
+##### Theta matrix (document-topic)
+```{r}
+lda_desc_document_6topic = desc_lda_mod6 %>%
+  tidy(matrix = "gamma") %>%
+  pivot_wider(names_from = topic, values_from = gamma)
+
+colnames(lda_desc_document_6topic) = c("listing_id", paste0("topic_", 1:6))
+
+desc_lda_results_6 = udpipe_detokenised_desc %>%
+  left_join(lda_desc_document_6topic %>% mutate(listing_id = as.numeric(listing_id)))
+
+
+# Check correlation
+cor(desc_lda_results_6%>%dplyr::select(-c(listing_id,price,review_scores_rating,annotated_desc)))
+corrplot::corrplot(cor(desc_lda_results_6%>%dplyr::select(-c(listing_id,price,review_scores_rating,annotated_desc))))
+summary(lm(topic_6~topic_1+topic_2+topic_3+topic_4+topic_5, desc_lda_results_6))
+```
+
+##### price vs 6 topics
+```{r}
+# price
+m_desc_lda_price_6 = lm(log(price)~topic_1+topic_2+topic_3+topic_4+topic_5+topic_6, data = desc_lda_results_6)
+summary(m_desc_lda_price_6)
+
+anova(m_desc_lda_price_6)
+```
+
+##### Label listings with topics
+```{r}
+View(desc_lda_results_6)
+
+desc_lda_results_6$labelled = colnames(desc_lda_results_6[,5:10])[max.col(desc_lda_results_6[,5:10],ties.method="first")]
+```
+
+
+
+#### LDA 8-topic modelling
+```{r eval = FALSE}
+desc_lda_mod8 = LDA(x = desc_dtm, method="Gibbs", k=8, 
+          control=list(seed=1234))
+
+saveRDS(desc_lda_mod8, "desc_lda_mod8.rds")
+```
+
+```{r}
+desc_lda_mod8 = readRDS("desc_lda_mod8.rds")
+```
+
+##### Beta matrix (topic-term)
+```{r}
+lda_desc_8topic_term = desc_lda_mod8 %>%
+  tidy(matrix = "beta") %>%
+  arrange(desc(beta))
+  
+lda_desc_8topic_term = lda_desc_8topic_term %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  mutate(term2 = fct_reorder(term, beta))
+
+lda_desc_8topic_term %>%
+  ggplot(aes(x = term2, y = beta, fill = as.factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~topic, scales = "free_y") +
+  coord_flip()
+```
+Topic1: House
+Topic2: host
+Topic3: 
+Topic4: Location (centre, city, close, restaurant, walk)
+Topic5: Facility (bathroom, kitchen, bedroom, shower)
+Topic6: Breakfast
+Topic7: Response
+
+Some topics are not interpretable.
+
+
+##### Theta matrix (document-topic)
+```{r}
+lda_desc_document_8topic = desc_lda_mod8 %>%
+  tidy(matrix = "gamma") %>%
+  pivot_wider(names_from = topic, values_from = gamma)
+
+colnames(lda_desc_document_8topic) = c("listing_id", paste0("topic_", 1:8))
+
+desc_lda_results_8 = udpipe_detokenised_desc %>%
+  left_join(lda_desc_document_8topic %>% mutate(listing_id = as.numeric(listing_id)))
+
+
+# Check correlation
+cor(desc_lda_results_8%>%select(-c(listing_id,price,review_scores_rating,annotated_desc)))
+corrplot::corrplot(cor(desc_lda_results_8%>%select(-c(listing_id,price,review_scores_rating,annotated_desc))))
+summary(lm(topic_8~topic_1+topic_2+topic_3+topic_4+topic_5+topic_6+topic_7+topic_8, desc_lda_results_8))
+```
+
+##### price vs 8 topics
+```{r}
+# price
+m_desc_lda_price_8 = lm(log(price)~topic_1+topic_2+topic_3+topic_4+topic_5+topic_6+topic_7+topic_8, data = desc_lda_results_8)
+summary(m_desc_lda_price_8)
+
+anova(m_desc_lda_price_8)
+```
+
+##### Label listings with topics
+```{r}
+View(desc_lda_results_8)
+
+desc_lda_results_8$labelled = colnames(desc_lda_results_8[,5:12])[max.col(desc_lda_results_8[,5:12],ties.method="first")]
+```
+
+
+
+
+
+### Final model: descriptions
+LDA with 8 topics: 0.2682
+LDA with 6 topics: 0.3214
+STM with 8 topics: 0.4651
+***STM with 9 topics: 0.5103*** is the best model
+
+```{r}
+stm_desc_9topic
+View(desc_corpus_9)
+```
+
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+######===========================Descriptions Ended===========================######
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+
+## Labelling topics
+### topics of reviews
+```{r}
+# stm model
+stm_reviews_6topic
+
+# theta matrix
+View(reviews_average_6)
+
+reviews_average_6$topic_content = plyr::revalue(reviews_average_6$labelled, 
+                                          c("topic_1" = "Hosts",
+                                            "topic_2" = "Services",
+                                            "topic_3" = "Facilities",
+                                            "topic_4" = "Properties",
+                                            "topic_5" = "Back in the Future",
+                                            "topic_6" = "Neighbourhoods"))
+
+reviews_average_6 = reviews_average_6 %>%
+  mutate(labelled = factor(labelled))
+```
+
+### topics of descriptions
+```{r}
+# stm model
+stm_desc_9topic
+
+# theta matrix
+View(desc_corpus_9)
+
+desc_corpus_9$topic_content = plyr::revalue(desc_corpus_9$labelled, 
+                                          c("topic_1" = "Hosts",
+                                            "topic_2" = "Services",
+                                            "topic_3" = "Facilities",
+                                            "topic_4" = "Properties",
+                                            "topic_5" = "Back in the Future",
+                                            "topic_6" = "Neighbourhoods",
+                                            "topic_7" = "label7",
+                                            "topic_8" = "label8",
+                                            "topic_9" = "label9"))
+
+desc_corpus_9 = desc_corpus_9 %>%
+  mutate(labelled = factor(labelled))
+```
+
+
+
+## Modelling
+### Predicting review rating scores (with reviews)
+```{r}
+all_review_predictors = all_review_rating_predictors %>%
+  inner_join(reviews_average_6 %>% select(-review_scores_rating, -price, -topic_content)) %>%
+  na.omit()
+```
+
+```{r eval=FALSE}
+m_reviews = lm(review_scores_rating ~. , all_review_predictors %>% select(-listing_id))
+m_reviews = MASS::stepAIC(m_reviews, direction = "backward")
+
+saveRDS(m_reviews , "m_reviews.rds")
+```
+
+```{r}
+m_reviews = readRDS("m_reviews.rds")
+
+summary(m_reviews)
+
+m_reviews_summary = as.data.frame(summary(m_reviews)$coefficient)
+colnames(m_reviews_summary)[4] = "p_value"
+sig_m_reviews_summary = m_reviews_summary %>%
+  filter(p_value < 0.05)
+
+row.names(sig_m_reviews_summary)
+```
+
+### Predicting price (with descriptions)
+```{r}
+all_price_predictors = price_predictors %>%
+  inner_join(desc_corpus_9 %>% select(-review_scores_rating, -price, -topic_content, -annotated_desc)) %>%
+  na.omit()
+```
+
+```{r eval=FALSE}
+m_price = lm(log(price) ~. , all_price_predictors %>% select(-listing_id))
+m_price = MASS::stepAIC(m_price, direction = "backward")
+
+saveRDS(m_price , "m_price.rds")
+```
+
+```{r}
+m_price = readRDS("m_price.rds")
+
+summary(m_price)
+
+m_price_summary = as.data.frame(summary(m_price)$coefficient)
+colnames(m_price_summary)[4] = "p_value"
+sig_m_price_summary = m_price_summary %>%
+  filter(p_value < 0.05)
+
+row.names(sig_m_price_summary)
+```
+
+
+
+## Question 1
+
+As can be seen from the 6-topic solution, topics are quite distinctive. Compared to 10-topic solution, 6-topic case is better.
+
+
+## Question 2: Effect Estimation
+### Estimate the effects of price and review score on topic probability
+```{r eval=FALSE}
+effects_review_6 = estimateEffect(~review_scores_rating+price,
+                          stmobj = stm_reviews_6topic,
+                          metadata = reviews_out$meta )
+
+
+effects_desc_9 = estimateEffect(~review_scores_rating+price,
+                          stmobj = stm_desc_9topic,
+                          metadata = desc_out$meta )
+
+saveRDS(effects_review_6, "effects_review_6.rds")
+saveRDS(effects_desc_9, "effects_desc_9.rds")
+```
+
+
+```{r}
+effects_review_6 = readRDS("effects_review_6.rds")
+effects_desc_9 = readRDS("effects_desc_9.rds")
+```
+
+
+#### Plot: Reviews Topic effects on Review_scores_rating
+```{r}
+plot(effects_review_6, covariate = "review_scores_rating",
+     topics = c(1:6),
+     model = stm_reviews_6topic, 
+     method = "difference",
+     cov.value1 = "100", cov.value2 = "0",
+     xlab = "Low Rating ... High Rating",
+     xlim = c(-0.04,0.04),
+     main = "Marginal Effects",
+     custom.labels = paste0("topic_",1:6),
+     labeltype = "custom")
+
+```
+
+Topic 1, topic 2 and topic 5 suggest a higher rating score. <br/>
+Topic 3, topic 4 and topic 6 suggest a lower rating score.
+
+#### Plot: Descriptions topic effects on prices
+```{r}
+plot(effects_desc_9, covariate = "price",
+     topics = c(1:9),
+     model = stm_desc_9topic, 
+     method = "difference",
+     cov.value1 = "100", cov.value2 = "0",
+     xlab = "Low Rating ... High Rating",
+     xlim = c(-0.004,0.004),
+     main = "Marginal Effects",
+     custom.labels = paste0("topic_",1:9),
+     labeltype = "custom")
+```
+Topic 1, 3, 6, 8, and 9 suggest a higher price.
+Topic 2, 5, and 7 suggest a lower price.
+Topic 4 provides no predictability to price.
+
+
+
+
+
+## Dominant topic in aggregation categories
+According to part A, we consider 6 aggregation categories: *neighbourhood_cleansed*, *host_is_superhost*, *property_type*, *room_type*, *bed_type*, and *cancellation_policy*.
+
+```{r eval = FALSE}
+reviews_average_6
+desc_corpus_9
+```
+
+```{r}
+listings$price = as.numeric(gsub("\\$", "", listings$price))
+listings = listings %>%
+  filter(!is.na(price)) %>%
+  filter(!is.na(review_scores_rating))
+
+review_final_topic_labels = reviews_average_6 %>%
+  left_join(listings)
+
+
+desc_final_topic_labels = desc_corpus_9 %>%
+  left_join(listings)
+```
+
+
+### neighbourhood_cleansed
+Top 5 neighbourhoods :"Ashley", "Central", "Clifton", "Lawrence Hill", "Clifton Down"
+
+#### Get the 3 topics from customers' reviews in each neighbourhood
+```{r}
+review_final_topic_labels %>%
+  filter(neighbourhood_cleansed %in% c("Ashley", "Central", "Clifton", "Lawrence Hill", "Clifton Down")) %>%
+  dplyr::count(neighbourhood_cleansed, topic_content) %>%
+  group_by(neighbourhood_cleansed) %>%
+  arrange(neighbourhood_cleansed, desc(n)) %>%
+  top_n(3, n)
+```
+
+#### Get the 3 topics from hosts' descriptions in each neighbourhood
+```{r}
+desc_final_topic_labels %>%
+  filter(neighbourhood_cleansed %in% c("Ashley", "Central", "Clifton", "Lawrence Hill", "Clifton Down")) %>%
+  dplyr::count(neighbourhood_cleansed, labelled) %>%
+  group_by(neighbourhood_cleansed) %>%
+  arrange(neighbourhood_cleansed, desc(n)) %>%
+  top_n(3, n)
+
+```
+
+
+
+### host_is_superhost
+#### Get the 3 topics from customers' reviews in each category
+```{r}
+review_final_topic_labels %>%
+  dplyr::count(host_is_superhost, labelled) %>%
+  group_by(host_is_superhost) %>%
+  arrange(host_is_superhost, desc(n)) %>%
+  top_n(3, n)
+```
+
+#### Get the 3 topics from hosts' descriptions in each category
+```{r}
+desc_final_topic_labels %>%
+  dplyr::count(host_is_superhost, labelled) %>%
+  group_by(host_is_superhost) %>%
+  arrange(host_is_superhost, desc(n)) %>%
+  top_n(3, n)
+```
+
+
+
+### property_type
+The top 5 property types are "Apartment", "House", "Townhouse", "Serviced apartment", and "Condominium".
+
+#### Get the 3 topics from customers' reviews in each property type
+```{r}
+review_final_topic_labels %>%
+  filter(property_type %in% c("Apartment", "House", "Townhouse", "Serviced apartment", "Condominium")) %>%
+  dplyr::count(property_type, labelled) %>%
+  group_by(property_type) %>%
+  arrange(property_type, desc(n)) %>%
+  top_n(3, n)
+```
+
+#### Get the 3 topics from hosts' descriptions in each property type
+```{r}
+desc_final_topic_labels %>%
+  filter(property_type %in% c("Apartment", "House", "Townhouse", "Serviced apartment", "Condominium")) %>%
+  dplyr::count(property_type, labelled) %>%
+  group_by(property_type) %>%
+  arrange(property_type, desc(n)) %>%
+  top_n(3, n)
+```
+
+
+
+### Column room_type
+#### Get top 3 topics from customers' reviews for each room type
+```{r}
+review_final_topic_labels %>%
+  dplyr::count(room_type, labelled) %>%
+  group_by(room_type) %>%
+  arrange(room_type, desc(n)) %>%
+  top_n(3, n)
+```
+#### Get top 3 topics from hosts' descriptions for each room type
+```{r}
+desc_final_topic_labels %>%
+  dplyr::count(room_type, labelled) %>%
+  group_by(room_type) %>%
+  arrange(room_type, desc(n)) %>%
+  top_n(3, n)
+```
+
+
+
+### Column bed_type
+#### Get top 3 topics from customers' reviews for each bed type
+```{r}
+review_final_topic_labels %>%
+  dplyr::count(bed_type, labelled) %>%
+  group_by(bed_type) %>%
+  arrange(bed_type, desc(n)) %>%
+  top_n(3, n)
+```
+#### Get top 3 topics from hosts' descriptions for each bed type
+```{r}
+desc_final_topic_labels %>%
+  dplyr::count(bed_type, labelled) %>%
+  group_by(bed_type) %>%
+  arrange(bed_type, desc(n)) %>%
+  top_n(3, n)
+```
+
+
+
+### Column cancellation_policy
+#### Get top 3 topics from customers' reviews for each cancellation policy
+```{r}
+review_final_topic_labels %>%
+  dplyr::count(cancellation_policy, labelled) %>%
+  group_by(cancellation_policy) %>%
+  arrange(cancellation_policy, desc(n)) %>%
+  top_n(3, n)
+```
+#### Get top 3 topics from hosts' descriptions for each cancellation policy
+```{r}
+desc_final_topic_labels %>%
+  dplyr::count(cancellation_policy, labelled) %>%
+  group_by(cancellation_policy) %>%
+  arrange(cancellation_policy, desc(n)) %>%
+  top_n(3, n)
+```
